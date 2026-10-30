@@ -55,12 +55,18 @@ pub fn fit(area: Rect, aspect: f64, max_width: u16) -> (usize, usize) {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    if app.show_video {
+    // Until the first frame arrives the browser stays up, with the spinner over it.
+    let loading = app
+        .player
+        .as_ref()
+        .is_none_or(|p| p.current.is_none() && p.video_error().is_none());
+    if app.show_video && !loading {
         draw_player(f, app);
     } else {
         draw_browser(f, app);
     }
-    if let Some(msg) = &app.busy {
+    let waiting = (app.show_video && loading).then(|| "buffering".to_string());
+    if let Some(msg) = app.busy.as_ref().or(waiting.as_ref()) {
         let spin = SPINNER[(app.ticks / 2) as usize % SPINNER.len()];
         let text = format!(" {spin} {msg} ");
         let width = (Span::raw(&text).width() as u16 + 4).min(f.area().width);
@@ -540,6 +546,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("↑ / ↓", "volume up / down"),
             ("r / R", "resolution up / down (graphics renderer)"),
             ("g", "switch pixel graphics / text blocks"),
+            ("f", "blurred background around narrow videos on / off"),
             ("h", "hide / show HUD"),
             ("q / esc / bksp", "stop and go back"),
             ("ctrl-c", "quit"),

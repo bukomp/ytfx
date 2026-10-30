@@ -84,6 +84,7 @@ Player:
 | `1-9` `0` `-` `=` | Toggle individual effects (map below) |
 | `r` / `R` | Resolution up / down (graphics renderer) |
 | `g` | Switch between pixel graphics and text blocks |
+| `f` | Blurred background around narrow videos on / off |
 | `h` | Hide / show HUD |
 | `?` | Help |
 | `q` / `esc` / `backspace` | Stop playback and go back |
@@ -97,6 +98,8 @@ Effect keys:
 | `2` | shake | `6` | glitch | `0` | pixel |
 | `3` | rgb | `7` | trails | `-` | mirror |
 | `4` | blur | `8` | invert | `=` | strobe |
+
+ytfx remembers the enabled effects, preset, intensity, bass sync and background fill across runs, in `~/.config/ytfx/settings.json`. `--no-sync` still turns sync off for one run.
 
 Presets (`p` / `P`; applying one replaces the current effect set):
 
@@ -157,7 +160,9 @@ There are two renderers:
 - **Graphics (kitty protocol):** used automatically in kitty, Ghostty and WezTerm. The video is sent as a real image at the resolution you choose (`--res`, or `r` / `R` while playing), and the terminal scales it to fit the window. kitty receives frames through shared memory, so even 720p costs almost nothing to send. Other terminals receive them inline as base64.
 - **Blocks:** used everywhere else, and inside tmux. Each cell shows two pixels with the `▀` character, so the resolution is the terminal grid. For example, 200 columns gives a 200x112 picture. To get more detail, make the font smaller.
 
-The source stream is fetched at 720p or at the chosen resolution, whichever is higher. With every effect on, processing takes about 15 ms per frame at 720p and about 30 ms at 1080p, so 1080p is near the limit at 30 fps.
+The source stream is fetched at 720p or at the chosen resolution, whichever is higher. With every effect on, processing takes about 7.5 ms per frame at 720p and about 17 ms at 1080p. With no effects on, it costs almost nothing.
+
+When the video doesn't fill its area (another aspect ratio, or smaller than the window), ytfx fills the empty space with a zoomed, blurred and darkened copy of the video. `f` turns this off.
 
 ## How the bass sync works
 
@@ -166,9 +171,10 @@ ytfx decodes the audio itself with ffmpeg and plays it through cpal. That means 
 Each frame the analyzer:
 
 1. Runs a 2048-point FFT on the latest played audio.
-2. Sums the 30-150 Hz band energy, with auto-gain, to get a "level".
-3. Computes spectral flux in that band and compares it to an adaptive threshold (mean + 1.5 sigma over about 1.5 s of history). A flux above the threshold is a beat.
-4. Sets a beat pulse that jumps on a beat and decays exponentially. The pulse scales every effect.
+2. Sums the 30-150 Hz band energy, averaged over two frames, to get the bass energy.
+3. Scales it with an auto-gain (a slow peak follower with a floor) to get a "level".
+4. Fires a beat only on a spike: the level must come near the recent peak, the energy must have at least doubled from its lowest point in the last 0.3 s, and after a beat the level must drop back before the next one can fire. Held or swelling bass lines, such as orchestral low strings or long 808s, wobble but don't do all three, so they don't trigger effects.
+5. Sets a beat pulse that jumps on a beat and decays exponentially. The pulse scales every effect.
 
 Video frames are scheduled against the audio clock (samples actually played), so audio and video stay in sync.
 
@@ -192,7 +198,7 @@ Video frames are scheduled against the audio clock (samples actually played), so
   2. Turn off your VPN or try another network.
   3. Press `L` and choose `f` to import a `cookies.txt` you exported yourself (ideally from a secondary Google account). Only that file is shared, and no browser or Keychain access is needed.
   4. Press `L` and choose `b` to let yt-dlp read your browser's cookie store. On macOS, Chromium browsers ask for Keychain access to decrypt it. Use this only if you are comfortable with that.
-- "YouTube rejected the cookies" or empty Home / Subscriptions: YouTube rotates the session of a browser that keeps browsing after you export, and the exported copy then stops working. Export from a private window instead: sign in to YouTube, open `https://www.youtube.com/robots.txt` in the same tab, export the youtube.com cookies, and close the private window right away. Then import the file with `L` → `f`, or copy it to `~/.config/ytfx/cookies.txt`.
+- "YouTube says this sign-in is no longer valid" or empty Home / Subscriptions: a browser that is signed in to Google refreshes the whole Google session in the background, even with no YouTube tab open, and that invalidates exported copies. Export from a private window instead: sign in to YouTube, open `https://www.youtube.com/robots.txt` in the same tab, export the youtube.com cookies, and close the private window right away. Then import the file with `L` → `f`, or copy it to `~/.config/ytfx/cookies.txt`. That session belongs to ytfx alone, and ytfx keeps it fresh by saving the cookies YouTube updates after each request.
 - Low resolution: in kitty, Ghostty or WezTerm, press `r`. In other terminals, the blocks renderer is limited by the cell grid (see Resolution).
 - Choppy video: lower the resolution (`R`), `--max-width` or `--fps`.
 - Wrong or banded colors: the terminal probably lacks truecolor support. Use one that has it.

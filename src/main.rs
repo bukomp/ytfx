@@ -5,6 +5,7 @@ mod effects;
 mod kitty;
 mod player;
 mod queue;
+mod settings;
 mod ui;
 mod youtube;
 
@@ -29,7 +30,7 @@ use ratatui::widgets::ListState;
 use account::Account;
 use analysis::Analyzer;
 use audio::AudioOut;
-use effects::{Drive, Effects, Fx, PRESETS, Rng};
+use effects::{Backdrop, Drive, Effects, Fx, PRESETS, Rng};
 use kitty::Kitty;
 use player::Player;
 use queue::{Queue, RADIO_LOW};
@@ -43,6 +44,10 @@ const LIST_LIMIT: usize = 100;
 const MIX_LIMIT: usize = 25;
 const SEEK_STEP: f64 = 10.0;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Check for baked-in black bars every this many frames; use a new crop once this many
+/// checks in a row agree (dark scenes and fades shouldn't make it jump).
+const CROP_EVERY: u64 = 8;
+const CROP_VOTES: u32 = 3;
 /// Consecutive videos that may fail to play before the queue stops.
 const MAX_FAILS: u32 = 3;
 /// Resolve the next video once the current one has played this long.
@@ -336,8 +341,17 @@ pub struct App {
     pub preset: usize,
     pub show_hud: bool,
     pub show_help: bool,
+    /// What's shown: the effects output, on a backdrop canvas when `fill` is on.
     pub frame_out: Vec<u8>,
     pub frame_dims: (usize, usize),
+    fx_out: Vec<u8>,
+    backdrop: Backdrop,
+    /// Fill space around the video with a blurred, darkened copy of it.
+    pub fill: bool,
+    /// Picture area inside black bars baked into the video, once stable.
+    crop: Option<effects::Crop>,
+    /// Latest detected crop and how many detections in a row agreed with it.
+    crop_vote: (effects::Crop, u32),
     pub renderer: Renderer,
     /// Present when the terminal supports the kitty graphics protocol.
     kitty: Option<Kitty>,
@@ -408,6 +422,11 @@ impl App {
             show_help: false,
             frame_out: Vec::new(),
             frame_dims: (0, 0),
+            fx_out: Vec::new(),
+            backdrop: Backdrop::default(),
+            fill: true,
+            crop: None,
+            crop_vote: ((0, 0, 0, 0), 0),
             renderer: if kitty.is_some() {
                 Renderer::Kitty
             } else {
@@ -426,6 +445,7 @@ impl App {
             quit: false,
             cfg,
         };
+        app.apply_settings(settings::load());
         if let Some(q) = app.cfg.initial.take() {
             app.query = q;
             app.submit_query();
@@ -675,6 +695,8 @@ impl App {
         match Player::new(info, &self.audio, size, self.cfg.fps) {
             Ok(p) => {
                 self.player = Some(p);
+                self.crop = None;
+                self.crop_vote.1 = 0;
                 self.analyzer.reset();
                 self.effects.reset();
             }
@@ -1018,9 +1040,114 @@ impl App {
             return;
         }
         if let Some(f) = self.player.as_ref().and_then(|p| p.current.as_ref()) {
+            // Look for baked-in black bars on the clean frame (effects add grain to them).
+            if self.fill && self.ticks.is_multiple_of(CROP_EVERY) {
+                let found = effects::content_rect(&f.data, f.w, f.h);
+                let close = |a: usize, b: usize| a.abs_diff(b) <= 2;
+                let (prev, n) = self.crop_vote;
+                let same = close(found.0, prev.0)
+                    && close(found.1, prev.1)
+                    && close(found.2, prev.2)
+                    && close(found.3, prev.3);
+                self.crop_vote = (found, if same { n + 1 } else { 1 });
+                if self.crop_vote.1 >= CROP_VOTES {
+                    self.crop = Some(found);
+                }
+            }
+            let crop = self
+                .crop
+                .filter(|c| c.2 <= f.w && c.3 <= f.h)
+                .unwrap_or((0, 0, f.w, f.h));
             self.effects
-                .render(&f.data, f.w, f.h, self.drive, dt, &mut self.frame_out);
-            self.frame_dims = (f.w, f.h);
+                .render(&f.data, f.w, f.h, self.drive, dt, &mut self.fx_out);
+            match self.fill_canvas(area, f.w, f.h, crop) {
+                Some((cw, ch)) => {
+                    self.backdrop.compose(
+                        &self.fx_out,
+                        f.w,
+                        f.h,
+                        crop,
+                        cw,
+                        ch,
+                        &mut self.frame_out,
+                    );
+                    self.frame_dims = (cw, ch);
+                }
+                None => {
+                    std::mem::swap(&mut self.fx_out, &mut self.frame_out);
+                    self.frame_dims = (f.w, f.h);
+                }
+            }
+        }
+    }
+
+    /// Canvas size in pixels that covers the whole video area around a fw x fh frame,
+    /// when the frame alone would leave empty space (and fill is on).
+    fn fill_canvas(
+        &self,
+        area: Rect,
+        fw: usize,
+        fh: usize,
+        crop: effects::Crop,
+    ) -> Option<(usize, usize)> {
+        let video = ui::video_area(area);
+        if !self.fill || video.width == 0 || video.height == 0 {
+            return None;
+        }
+        let (cw, ch) = match self.renderer {
+            // One cell is one pixel wide and two tall.
+            Renderer::Blocks => (video.width as usize, video.height as usize * 2),
+            Renderer::Kitty => {
+                // Area aspect in pixels; grow the frame to it in one direction.
+                let aspect = video.width as f64 / (video.height as f64 * self.cell_aspect);
+                if aspect > fw as f64 / fh as f64 {
+                    ((fh as f64 * aspect) as usize, fh)
+                } else {
+                    (fw, (fw as f64 / aspect) as usize)
+                }
+            }
+        };
+        // Nothing worth filling, or the frame is from before a resize and doesn't fit.
+        let picture = (crop.2 - crop.0) * (crop.3 - crop.1);
+        let gain = (cw * ch) as f64 / picture as f64;
+        (cw >= fw && ch >= fh && gain > 1.02).then_some((cw, ch))
+    }
+
+    fn apply_settings(&mut self, s: settings::Settings) {
+        if let Some(i) = s
+            .preset
+            .and_then(|name| PRESETS.iter().position(|p| p.name == name))
+        {
+            self.set_preset(i);
+        }
+        if let Some(labels) = s.effects {
+            let fxs: Vec<Fx> = labels.iter().filter_map(|l| Fx::from_label(l)).collect();
+            self.effects.set_enabled(&fxs);
+        }
+        if let Some(i) = s.intensity.filter(|i| i.is_finite()) {
+            self.effects.intensity = i.clamp(0.1, 2.0);
+        }
+        // --no-sync on the command line wins over the saved choice.
+        self.sync = self.sync && s.sync.unwrap_or(true);
+        self.fill = s.fill.unwrap_or(true);
+    }
+
+    fn save_settings(&mut self) {
+        let s = settings::Settings {
+            effects: Some(
+                self.effects
+                    .enabled()
+                    .iter()
+                    .map(|fx| fx.label().to_string())
+                    .collect(),
+            ),
+            preset: Some(PRESETS[self.preset].name.to_string()),
+            intensity: Some((self.effects.intensity * 10.0).round() / 10.0),
+            sync: Some(self.sync),
+            fill: Some(self.fill),
+        };
+        if let Err(e) = settings::save(&s) {
+            self.status = Some((format!("couldn't save settings: {e:#}"), true));
         }
     }
 
@@ -1333,22 +1460,33 @@ impl App {
                     .shared
                     .set_volume(self.audio.shared.volume() - 0.1);
             }
-            KeyCode::Char('s') => return self.sync = !self.sync,
-            KeyCode::Char('p') => return self.set_preset((self.preset + 1) % PRESETS.len()),
+            KeyCode::Char('s') => self.sync = !self.sync,
+            KeyCode::Char('f') => self.fill = !self.fill,
+            KeyCode::Char('p') => self.set_preset((self.preset + 1) % PRESETS.len()),
             KeyCode::Char('P') => {
-                return self.set_preset((self.preset + PRESETS.len() - 1) % PRESETS.len());
+                self.set_preset((self.preset + PRESETS.len() - 1) % PRESETS.len())
             }
             KeyCode::Char('[') => {
-                return self.effects.intensity = (self.effects.intensity - 0.1).max(0.1);
+                self.effects.intensity = (self.effects.intensity - 0.1).max(0.1)
             }
             KeyCode::Char(']') => {
-                return self.effects.intensity = (self.effects.intensity + 0.1).min(2.0);
+                self.effects.intensity = (self.effects.intensity + 0.1).min(2.0)
+            }
+            KeyCode::Char(c) if Fx::from_key(c).is_some() => {
+                if let Some(fx) = Fx::from_key(c) {
+                    self.effects.toggle(fx);
+                }
             }
             KeyCode::Char('h') => return self.show_hud = !self.show_hud,
             KeyCode::Char('r') => return self.step_res(true),
             KeyCode::Char('R') => return self.step_res(false),
             KeyCode::Char('g') => return self.toggle_renderer(),
             _ => {}
+        }
+        if matches!(k.code, KeyCode::Char('s' | 'f' | 'p' | 'P' | '[' | ']'))
+            || matches!(k.code, KeyCode::Char(c) if Fx::from_key(c).is_some())
+        {
+            return self.save_settings();
         }
 
         let Some(p) = self.player.as_mut() else {
@@ -1359,13 +1497,37 @@ impl App {
             KeyCode::Char(' ') => p.toggle_pause(),
             KeyCode::Left => self.status = seek(p, -SEEK_STEP),
             KeyCode::Right => self.status = seek(p, SEEK_STEP),
-            KeyCode::Char(c) => {
-                if let Some(fx) = Fx::from_key(c) {
-                    self.effects.toggle(fx);
-                }
-            }
             _ => {}
         }
+    }
+
+    /// Changes when what's on screen moves around: another screen, tab, list, scroll
+    /// position, overlay or video. Not on things that tick, like the clock or spinner.
+    fn layout_signature(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        let view = self.view();
+        (
+            self.show_video,
+            self.tab as u8,
+            self.tabs[self.tab as usize].len(),
+            view.entries.len(),
+            view.state.offset(),
+            view.loading,
+            self.queue.items.len(),
+            self.queue_state.offset(),
+        )
+            .hash(&mut h);
+        (
+            self.busy.is_some(),
+            self.show_help,
+            self.account_ui.is_some(),
+            &self.status,
+            self.player.as_ref().map(|p| &p.title),
+            matches!(self.focus, Focus::Search),
+        )
+            .hash(&mut h);
+        h.finish()
     }
 
     fn set_preset(&mut self, i: usize) {
@@ -1398,6 +1560,7 @@ fn video_id(url: &str) -> Option<String> {
 
 fn run(term: &mut Term, app: &mut App) -> Result<()> {
     let mut last = Instant::now();
+    let mut last_layout = 0;
     while !app.quit {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.1);
@@ -1419,6 +1582,17 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
         queue!(term.backend_mut(), BeginSynchronizedUpdate)?;
         app.image_rect = None;
         term.draw(|f| ui::draw(f, app))?;
+        // ratatui only rewrites cells it thinks changed. Titles with characters whose
+        // width the terminal sees differently (ambiguous-width symbols, some emoji) shift
+        // the rest of their row, and those cells would never be cleaned up. Whenever the
+        // layout changes, repaint everything (inside the synchronized update: no flicker).
+        let layout = app.layout_signature();
+        if layout != last_layout {
+            last_layout = layout;
+            term.clear()?;
+            app.image_rect = None;
+            term.draw(|f| ui::draw(f, app))?;
+        }
         draw_image(term, app)?;
         execute!(term.backend_mut(), EndSynchronizedUpdate)?;
 
@@ -1485,6 +1659,7 @@ fn main() -> Result<()> {
     check_tool("ffmpeg", "-version")?;
 
     // Command-line cookies win for this session; otherwise use the saved account.
+    youtube::remove_cookie_copies(false);
     let mut startup_error = None;
     let signed_in = if let Some(auth) = cfg.auth.take() {
         youtube::set_auth(Some(auth));
@@ -1518,6 +1693,7 @@ fn main() -> Result<()> {
     }
     drop(app);
     restore_terminal();
+    youtube::remove_cookie_copies(true);
     result
 }
 

@@ -51,7 +51,7 @@ impl Account {
     }
 }
 
-fn config_dir() -> Result<PathBuf> {
+pub fn config_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config"),
@@ -178,7 +178,7 @@ fn youtube_cookies(text: &str) -> Result<(String, usize)> {
 
 /// Write `data` to `path` with mode 0600, via a fresh temp file so a symlink or an
 /// existing file with looser permissions is never written through.
-fn write_private(path: &Path, data: &str) -> Result<()> {
+pub fn write_private(path: &Path, data: &str) -> Result<()> {
     let dir = path.parent().context("bad config path")?;
     if let Some(parent) = dir.parent() {
         fs::create_dir_all(parent)?;

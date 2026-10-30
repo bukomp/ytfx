@@ -30,8 +30,18 @@ pub fn set_auth(auth: Option<Auth>) {
 
 /// yt-dlp saves its cookie jar back to the `--cookies` file when it exits (truncate and
 /// rewrite, no locking), so it never gets the saved file: each run reads a private copy
-/// that is deleted afterwards, and whatever yt-dlp writes back is thrown away.
-struct CookieCopy(PathBuf);
+/// that is deleted afterwards. Cookies YouTube refreshed during the run are merged back
+/// into the saved account file (see `save_back`), which keeps that session alive.
+struct CookieCopy {
+    path: PathBuf,
+    /// The saved file the copy came from, when refreshed cookies should go back into it.
+    source: Option<PathBuf>,
+    /// The copy's contents before yt-dlp ran.
+    before: String,
+}
+
+/// Serializes merges into the saved cookie file between concurrent yt-dlp runs.
+static SAVE_BACK: Mutex<()> = Mutex::new(());
 
 impl CookieCopy {
     fn new(src: &Path) -> Result<Self> {
@@ -44,16 +54,108 @@ impl CookieCopy {
             .mode(0o600)
             .open(&path)
             .context("can't create a temporary cookie file")?;
-        let copy = CookieCopy(path);
+        // Only the account file ytfx manages gets updates; a --cookies file stays untouched.
+        let ours = crate::account::cookies_path().is_ok_and(|p| p == src);
+        let copy = CookieCopy {
+            path,
+            source: ours.then(|| src.to_path_buf()),
+            before: String::from_utf8_lossy(&data).into_owned(),
+        };
         f.write_all(&data)?;
         Ok(copy)
+    }
+
+    /// Merge cookies that changed during the run into the saved file.
+    fn save_back(&self) -> Result<()> {
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        let after = String::from_utf8_lossy(&fs::read(&self.path)?).into_owned();
+        let _lock = SAVE_BACK.lock().unwrap_or_else(|e| e.into_inner());
+        let current = fs::read_to_string(source)?;
+        if let Some(merged) = merge_cookies(&current, &self.before, &after) {
+            crate::account::write_private(source, &merged)?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for CookieCopy {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = self.save_back();
+        let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Delete temporary cookie copies: this process's own (call on exit, when background runs
+/// may still hold some), and those of earlier ytfx processes that are gone.
+pub fn remove_cookie_copies(own: bool) {
+    let me = std::process::id();
+    let Ok(dir) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("ytfx-cookies-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // SAFETY: kill with signal 0 only checks whether the process exists.
+        let alive = pid != me && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        if (pid == me && own) || (pid != me && !alive) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// (domain, path, name) of a Netscape cookie line, or None for comments and junk.
+fn cookie_key(line: &str) -> Option<(&str, &str, &str)> {
+    let body = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+    if body.starts_with('#') || line.chars().any(|c| c.is_control() && c != '\t') {
+        return None;
+    }
+    let f: Vec<&str> = body.split('\t').collect();
+    (f.len() == 7).then(|| (f[0], f[2], f[5]))
+}
+
+fn is_youtube_domain(domain: &str) -> bool {
+    let d = domain.trim_start_matches('.');
+    d == "youtube.com" || d.ends_with(".youtube.com")
+}
+
+/// Apply what a yt-dlp run changed (`before` -> `after`) to `current`: youtube.com
+/// cookies that are new or have a new value. Removals are ignored. None if nothing changed.
+fn merge_cookies(current: &str, before: &str, after: &str) -> Option<String> {
+    let old: std::collections::HashSet<&str> = before.lines().collect();
+    let changed: Vec<(_, &str)> = after
+        .lines()
+        .filter(|l| !old.contains(l))
+        .filter_map(|l| cookie_key(l).map(|k| (k, l)))
+        .filter(|(k, _)| is_youtube_domain(k.0))
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = current.lines().collect();
+    let mut out_changed = false;
+    for (key, line) in changed {
+        match lines.iter().position(|l| cookie_key(l) == Some(key)) {
+            Some(i) if lines[i] != line => {
+                lines[i] = line;
+                out_changed = true;
+            }
+            Some(_) => {}
+            None => {
+                lines.push(line);
+                out_changed = true;
+            }
+        }
+    }
+    out_changed.then(|| lines.join("\n") + "\n")
 }
 
 /// A yt-dlp command for `target`, signed in only when the target is YouTube itself, so
@@ -70,7 +172,7 @@ fn yt_dlp(target: &str) -> Result<(Command, Option<CookieCopy>)> {
             }
             Some(Auth::CookiesFile(src)) => {
                 let c = CookieCopy::new(&src)?;
-                cmd.arg("--cookies").arg(&c.0);
+                cmd.arg("--cookies").arg(&c.path);
                 copy = Some(c);
             }
             None => {}
@@ -366,9 +468,11 @@ pub fn list(target: &str, limit: usize) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-const COOKIES_ROTATED: &str = "YouTube rejected the cookies: the browser rotated that session after \
-     export. Export again from a private window (sign in, open youtube.com/robots.txt, export, \
-     close the window), then import with L";
+const COOKIES_ROTATED: &str = "YouTube says this sign-in is no longer valid. A browser that is \
+     signed in to Google refreshes the session in the background, even with no YouTube tab \
+     open, and that kills exported copies. Export from a private window instead (sign in, \
+     open youtube.com/robots.txt, export, close the window), then import with L. ytfx keeps \
+     that session fresh by itself.";
 
 /// Videos for radio: YouTube's Mix for `seed` (related videos, starting with it). Some
 /// videos have no Mix; then a search for the seed's channel and title stands in.
@@ -573,7 +677,7 @@ mod tests {
         let src = std::env::temp_dir().join(format!("ytfx-test-src-{}.txt", std::process::id()));
         fs::write(&src, "x").unwrap();
         let copy = CookieCopy::new(&src).unwrap();
-        let path = copy.0.clone();
+        let path = copy.path.clone();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         drop(copy);
@@ -589,6 +693,26 @@ mod tests {
         );
         let normal = "https://www.youtube.com/playlist?list=PLGBKsNyGY-afUo7nfXwctjuJgCtqrYI6Q";
         assert_eq!(list_url(normal), normal);
+    }
+
+    #[test]
+    fn refreshed_youtube_cookies_are_merged_back() {
+        let line = |d: &str, n: &str, v: &str| format!("{d}\tTRUE\t/\tTRUE\t1900000000\t{n}\t{v}");
+        let header = "# Netscape HTTP Cookie File\n";
+        let current = format!("{header}{}\n{}\n", line(".youtube.com", "SID", "a"), line(".youtube.com", "SIDCC", "old"));
+        let before = current.clone();
+        let after = format!(
+            "{header}{}\n{}\n{}\n{}\n",
+            line(".youtube.com", "SID", "a"),
+            line(".youtube.com", "SIDCC", "new"),
+            line(".youtube.com", "YSC", "x"),
+            line(".evil.example", "track", "y"),
+        );
+        let merged = merge_cookies(&current, &before, &after).unwrap();
+        assert!(merged.contains("SIDCC\tnew") && !merged.contains("SIDCC\told"));
+        assert!(merged.contains("YSC\tx") && !merged.contains("evil"));
+        assert!(merged.starts_with(header));
+        assert_eq!(merge_cookies(&current, &before, &before), None);
     }
 
     #[test]
