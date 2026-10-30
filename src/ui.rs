@@ -5,8 +5,10 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Widget};
 
+use crate::account::BROWSERS;
 use crate::effects::{Fx, PRESETS};
-use crate::{App, Focus, RES_STEPS, Renderer};
+use crate::youtube::{Entry, Kind};
+use crate::{AccountUi, App, Focus, RES_STEPS, Renderer, Tab};
 
 pub const HUD_HEIGHT: u16 = 2;
 const ACCENT: Color = Color::Rgb(255, 40, 60);
@@ -53,7 +55,7 @@ pub fn fit(area: Rect, aspect: f64, max_width: u16) -> (usize, usize) {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    if app.player.is_some() {
+    if app.show_video {
         draw_player(f, app);
     } else {
         draw_browser(f, app);
@@ -71,8 +73,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             rect,
         );
     }
+    if app.account_ui.is_some() {
+        draw_account(f, app);
+    }
     if app.show_help {
-        draw_help(f, app.player.is_some());
+        draw_help(f, app.show_video);
     }
 }
 
@@ -81,92 +86,84 @@ fn rounded() -> Block<'static> {
 }
 
 fn draw_browser(f: &mut Frame, app: &mut App) {
-    let [header, search, list, footer] = Layout::vertical([
+    let search_tab = app.tab == Tab::Search;
+    let [header, search, list, playing, footer] = Layout::vertical([
         Constraint::Length(2),
-        Constraint::Length(3),
+        Constraint::Length(if search_tab { 3 } else { 0 }),
         Constraint::Min(1),
+        Constraint::Length(u16::from(app.active)),
         Constraint::Length(1),
     ])
     .areas(f.area());
 
-    let title = Line::from(vec![
+    // Header: logo, tabs, account.
+    let mut spans = vec![
         Span::styled(
             " ▓▒░ YTFX ░▒▓ ",
             Style::new().fg(Color::Black).bg(ACCENT).bold(),
         ),
-        Span::styled(
-            "  youtube browser · bass-synced edit fx",
-            Style::new().fg(DIM),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(title), header);
-
-    let search_focused = matches!(app.focus, Focus::Search);
-    let line = if search_focused {
-        Line::from(vec![
-            Span::raw(app.query.as_str()),
-            Span::styled("▏", Style::new().fg(ACCENT)),
-        ])
-    } else if app.query.is_empty() {
-        Line::from(Span::styled(
-            "press / to search, or paste a YouTube URL",
-            Style::new().fg(DIM),
-        ))
-    } else {
-        Line::from(app.query.as_str())
+        Span::raw(" "),
+    ];
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        let style = if *tab == app.tab {
+            Style::new().fg(Color::White).bg(Color::Rgb(70, 10, 20)).bold()
+        } else {
+            Style::new().fg(DIM)
+        };
+        let label = match tab {
+            Tab::Queue if !app.queue.items.is_empty() => {
+                format!(" {} {} ({}) ", i + 1, tab.label(), app.queue.items.len())
+            }
+            _ => format!(" {} {} ", i + 1, tab.label()),
+        };
+        spans.push(Span::styled(label, style));
+    }
+    let [tabs_area, account_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(30)]).areas(header);
+    f.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+    let account = match &app.signed_in {
+        Some(how) => Span::styled(format!("● {how} "), Style::new().fg(CHANNEL)),
+        None => Span::styled("L sign in ", Style::new().fg(DIM)),
     };
     f.render_widget(
-        Paragraph::new(line).block(
-            rounded()
-                .title(" search ")
-                .border_style(Style::new().fg(if search_focused { ACCENT } else { DIM })),
-        ),
-        search,
+        Paragraph::new(Line::from(account)).alignment(Alignment::Right),
+        account_area,
     );
 
-    let block = rounded()
-        .title(format!(" results ({}) ", app.results.len()))
-        .border_style(Style::new().fg(if search_focused { DIM } else { ACCENT }));
-    if app.results.is_empty() {
-        let hint = Paragraph::new("type a search and press enter")
-            .fg(DIM)
-            .alignment(Alignment::Center);
-        f.render_widget(hint.block(block), list);
+    let search_focused = matches!(app.focus, Focus::Search);
+    if search_tab {
+        let line = if search_focused {
+            Line::from(vec![
+                Span::raw(app.query.as_str()),
+                Span::styled("▏", Style::new().fg(ACCENT)),
+            ])
+        } else if app.query.is_empty() {
+            Line::from(Span::styled(
+                "press / to search, or paste a YouTube URL",
+                Style::new().fg(DIM),
+            ))
+        } else {
+            Line::from(app.query.as_str())
+        };
+        f.render_widget(
+            Paragraph::new(line).block(
+                rounded()
+                    .title(format!(" search {} (ctrl-t) ", app.search_kind.label()))
+                    .border_style(Style::new().fg(if search_focused { ACCENT } else { DIM })),
+            ),
+            search,
+        );
+    }
+
+    let border = Style::new().fg(if search_focused { DIM } else { ACCENT });
+    if app.tab == Tab::Queue {
+        draw_queue(f, app, list, border);
     } else {
-        let items: Vec<ListItem> = app
-            .results
-            .iter()
-            .map(|r| {
-                let mut spans = vec![Span::styled(
-                    r.title.as_str(),
-                    Style::new().fg(Color::White).bold(),
-                )];
-                if !r.channel.is_empty() {
-                    spans.push(Span::styled(
-                        format!("  {}", r.channel),
-                        Style::new().fg(CHANNEL),
-                    ));
-                }
-                if let Some(d) = r.duration {
-                    spans.push(Span::styled(
-                        format!("  {}", fmt_time(d)),
-                        Style::new().fg(Color::Gray),
-                    ));
-                }
-                if let Some(v) = r.views {
-                    spans.push(Span::styled(
-                        format!("  {} views", fmt_count(v)),
-                        Style::new().fg(DIM),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-        let list_widget = List::new(items)
-            .block(block)
-            .highlight_style(Style::new().bg(Color::Rgb(70, 10, 20)))
-            .highlight_symbol("▶ ");
-        f.render_stateful_widget(list_widget, list, &mut app.list);
+        draw_list(f, app, list, border);
+    }
+
+    if app.active {
+        draw_now_playing(f, app, playing);
     }
 
     let footer_line = match &app.status {
@@ -175,15 +172,200 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             format!(" {msg}"),
             Style::new().fg(Color::Gray),
         )),
-        None => hints(&[
+        None if app.tab == Tab::Queue => hints(&[
             ("enter", "play"),
-            ("/", "search"),
-            ("j/k", "move"),
+            ("x", "remove"),
+            ("R", "radio"),
+            ("S", "shuffle"),
+            ("1-5", "tabs"),
             ("?", "help"),
-            ("q", "quit"),
+        ]),
+        None => hints(&[
+            ("enter", "play/open"),
+            ("r", "radio"),
+            ("a", "queue"),
+            ("S", "shuffle all"),
+            ("1-5", "tabs"),
+            ("L", "account"),
+            ("?", "help"),
         ]),
     };
     f.render_widget(Paragraph::new(footer_line), footer);
+}
+
+fn draw_list(f: &mut Frame, app: &mut App, area: Rect, border: Style) {
+    let spin = SPINNER[(app.ticks / 2) as usize % SPINNER.len()];
+    let stack = &app.tabs[app.tab as usize];
+    let path: Vec<&str> = stack.iter().map(|v| v.title.as_str()).collect();
+    let view = stack.last().expect("tab stacks are never empty");
+    let mut title = format!(" {} ", path.join(" › "));
+    if view.loading {
+        title.push_str(&format!("{spin} "));
+    } else if !view.entries.is_empty() {
+        title.push_str(&format!("({}) ", view.entries.len()));
+    }
+    let block = rounded().title(title).border_style(border);
+
+    if view.entries.is_empty() {
+        let (msg, color) = match &view.note {
+            _ if view.loading => (format!("{spin} loading"), DIM),
+            Some((msg, true)) => (format!("✗ {msg}"), ACCENT),
+            Some((msg, false)) => (msg.clone(), DIM),
+            None if app.tab == Tab::Search => ("type a search and press enter".into(), DIM),
+            None => (String::new(), DIM),
+        };
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new(msg)
+                .fg(color)
+                .alignment(Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+            centered(inner, inner.width, inner.height.min(3)),
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = view.entries.iter().map(|e| entry_item(e, None)).collect();
+    let list_widget = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(Color::Rgb(70, 10, 20)))
+        .highlight_symbol("▶ ");
+    // Render with a copy of the selection state; the original stays borrowed by `items`.
+    let mut state = view.state.clone();
+    f.render_stateful_widget(list_widget, area, &mut state);
+    let view = app.tabs[app.tab as usize]
+        .last_mut()
+        .expect("tab stacks are never empty");
+    view.state = state;
+}
+
+fn draw_queue(f: &mut Frame, app: &mut App, area: Rect, border: Style) {
+    let q = &app.queue;
+    let mut title = format!(" queue ({}) ", q.items.len());
+    if q.radio {
+        title.push_str("· radio ");
+    }
+    let block = rounded().title(title).border_style(border);
+    if q.items.is_empty() {
+        f.render_widget(
+            Paragraph::new("empty: play a playlist or feed, press r for radio, or a to add videos")
+                .fg(DIM)
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let playing = app.active.then_some(q.pos);
+    let items: Vec<ListItem> = q
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, e)| entry_item(e, Some(playing == Some(i))))
+        .collect();
+    if app.queue_state.selected().is_none() {
+        app.queue_state.select(Some(q.pos));
+    }
+    let list_widget = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(Color::Rgb(70, 10, 20)))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list_widget, area, &mut app.queue_state);
+}
+
+/// One list row. `playing` is Some for queue rows (marks the current video).
+fn entry_item(e: &Entry, playing: Option<bool>) -> ListItem<'_> {
+    let mut spans = Vec::new();
+    match playing {
+        Some(true) => spans.push(Span::styled("♪ ", Style::new().fg(ACCENT).bold())),
+        Some(false) => spans.push(Span::raw("  ")),
+        None => {}
+    }
+    match e.kind {
+        Kind::Video => {}
+        // Not ☰: Unicode 16 made the trigrams wide, and terminals disagree on that.
+        Kind::Playlist => spans.push(Span::styled("≡ ", Style::new().fg(ACCENT))),
+        Kind::Channel => spans.push(Span::styled("◉ ", Style::new().fg(CHANNEL))),
+    }
+    spans.push(Span::styled(
+        e.title.as_str(),
+        Style::new().fg(Color::White).bold(),
+    ));
+    if !e.channel.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", e.channel),
+            Style::new().fg(CHANNEL),
+        ));
+    }
+    if let Some(d) = e.duration {
+        spans.push(Span::styled(
+            format!("  {}", fmt_time(d)),
+            Style::new().fg(Color::Gray),
+        ));
+    }
+    if let Some(v) = e.views {
+        spans.push(Span::styled(
+            format!("  {} views", fmt_count(v)),
+            Style::new().fg(DIM),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// One line at the bottom of the browser while something plays in the background.
+fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans = Vec::new();
+    match &app.player {
+        Some(p) => {
+            let icon = if p.paused() { "⏸" } else { "▶" };
+            let title: String = p.title.chars().take(50).collect();
+            spans.push(Span::styled(
+                format!(" {icon} {title} "),
+                Style::new().fg(Color::White).bold(),
+            ));
+            let time = match p.duration {
+                Some(d) => format!("{} / {} ", fmt_time(p.position()), fmt_time(d)),
+                None => format!("{} ", fmt_time(p.position())),
+            };
+            spans.push(Span::styled(time, Style::new().fg(Color::Gray)));
+        }
+        None => {
+            let spin = SPINNER[(app.ticks / 2) as usize % SPINNER.len()];
+            spans.push(Span::styled(
+                format!(" {spin} loading "),
+                Style::new().fg(DIM),
+            ));
+        }
+    }
+    spans.extend(queue_badge(app));
+    spans.push(Span::styled(
+        "  v video  space pause  n/N next/prev",
+        Style::new().fg(DIM),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(Color::Rgb(25, 8, 12))),
+        area,
+    );
+}
+
+/// "[3/25] RADIO" when there is a queue.
+fn queue_badge(app: &App) -> Vec<Span<'static>> {
+    let q = &app.queue;
+    let mut spans = Vec::new();
+    if q.items.len() > 1 {
+        spans.push(Span::styled(
+            format!("[{}/{}] ", q.pos + 1, q.items.len()),
+            Style::new().fg(Color::Gray),
+        ));
+    }
+    if q.radio {
+        spans.push(Span::styled(
+            "RADIO ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans
 }
 
 fn draw_player(f: &mut Frame, app: &mut App) {
@@ -196,7 +378,7 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     if have_frame && app.renderer == Renderer::Kitty {
         // Leave the cells empty; main draws the image here after ratatui is done.
         // Overlays hide it, since the image would cover their background.
-        if !app.show_help && app.busy.is_none() {
+        if !app.show_help && app.busy.is_none() && app.account_ui.is_none() {
             app.image_rect = Some(fit_cells(video, fw as f64 / fh as f64, app.cell_aspect));
         }
     } else if have_frame {
@@ -216,7 +398,7 @@ fn draw_player(f: &mut Frame, app: &mut App) {
             },
             rect,
         );
-    } else {
+    } else if app.player.is_some() {
         let spin = SPINNER[(app.ticks / 2) as usize % SPINNER.len()];
         let error = app
             .player
@@ -271,17 +453,23 @@ fn draw_hud(f: &mut Frame, app: &App, area: Rect) {
         ),
         Style::new().fg(DIM),
     );
-    let bar_w = (top.width as usize).saturating_sub(left.width() + time.width() + vol.width());
+    let badge = queue_badge(app);
+    let badge_w: usize = badge.iter().map(Span::width).sum();
+    let bar_w = (top.width as usize)
+        .saturating_sub(left.width() + time.width() + vol.width() + badge_w + 1);
     let filled = p
         .duration
         .map_or(0, |d| ((pos / d).clamp(0.0, 1.0) * bar_w as f64) as usize);
-    let line1 = Line::from(vec![
+    let mut line1 = vec![
         left,
         Span::styled("━".repeat(filled), Style::new().fg(ACCENT)),
         Span::styled("─".repeat(bar_w - filled), Style::new().fg(DIM)),
         time,
-        vol,
-    ]);
+        Span::raw(" "),
+    ];
+    line1.extend(badge);
+    line1.push(vol);
+    let line1 = Line::from(line1);
     f.render_widget(Paragraph::new(line1), top);
 
     // Line 2: sync state, beat light, spectrum, preset, effect toggles.
@@ -340,6 +528,10 @@ fn draw_help(f: &mut Frame, playing: bool) {
     let rows: &[(&str, &str)] = if playing {
         &[
             ("space", "pause / resume"),
+            ("n / N", "next / previous video in the queue"),
+            ("m", "radio: queue videos like this one"),
+            ("z", "shuffle the rest of the queue"),
+            ("b / tab", "browse while it keeps playing"),
             ("s", "toggle bass sync (off = steady fx + random hits)"),
             ("p / P", "next / previous preset"),
             ("1-9 0 - =", "toggle individual effects"),
@@ -349,18 +541,25 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("r / R", "resolution up / down (graphics renderer)"),
             ("g", "switch pixel graphics / text blocks"),
             ("h", "hide / show HUD"),
-            ("q / esc / bksp", "back to results"),
+            ("q / esc / bksp", "stop and go back"),
             ("ctrl-c", "quit"),
         ]
     } else {
         &[
-            ("/ or i", "focus search box"),
-            ("enter", "search / play selected"),
-            ("j/k ↑/↓", "move selection"),
-            ("pgup / pgdn", "move by 10"),
-            ("g / G", "first / last result"),
-            ("tab", "switch search / results"),
-            ("?", "this help"),
+            ("1-5 / tab", "search, home, subscriptions, library, queue"),
+            ("/ or i", "search (ctrl-t: videos / playlists / channels)"),
+            ("enter", "play video / open playlist or channel"),
+            ("esc / bksp / h", "back out of a playlist or channel"),
+            ("j/k ↑/↓", "move selection (pgup/pgdn, g/G)"),
+            ("r", "radio from the selected video"),
+            ("R", "radio from a random video in this list"),
+            ("S", "shuffle-play this list"),
+            ("a", "add the selected video to the queue"),
+            ("x", "remove from the queue (queue tab)"),
+            ("u", "reload this list"),
+            ("L", "YouTube account (sign in / out)"),
+            ("v", "back to the playing video"),
+            ("space / n / N", "pause, next, previous while playing"),
             ("q / esc", "quit"),
         ]
     };
@@ -386,7 +585,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ));
         }
     }
-    let rect = centered(f.area(), 60, lines.len() as u16 + 2);
+    let rect = centered(f.area(), 68, lines.len() as u16 + 2);
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(
@@ -394,6 +593,94 @@ fn draw_help(f: &mut Frame, playing: bool) {
                 .title(" keys ")
                 .border_style(Style::new().fg(ACCENT)),
         ),
+        rect,
+    );
+}
+
+fn draw_account(f: &mut Frame, app: &App) {
+    let key = |k: &'static str, v: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<4}"), Style::new().fg(ACCENT).bold()),
+            Span::styled(v, Style::new().fg(Color::White)),
+        ])
+    };
+    let note = |text: &'static str| Line::styled(text, Style::new().fg(Color::Gray));
+    let mut lines = vec![
+        Line::from(match &app.signed_in {
+            Some(how) => Span::styled(format!("signed in with {how}"), Style::new().fg(CHANNEL)),
+            None => Span::styled("not signed in", Style::new().fg(DIM)),
+        }),
+        Line::raw(""),
+    ];
+    match app.account_ui {
+        Some(AccountUi::Menu) | None => {
+            lines.extend([
+                key("f", "import a cookies.txt file (recommended)"),
+                key("b", "let yt-dlp read a browser's cookies"),
+                key("o", "sign out and delete imported cookies"),
+                key("esc", "close"),
+                Line::raw(""),
+                note("Signing in shows your recommendations, subscriptions and"),
+                note("library. ytfx never reads browser data unless you pick b."),
+                Line::raw(""),
+                note("For f: in a browser signed in to YouTube, export cookies"),
+                note("from a youtube.com tab with a cookies.txt extension (for"),
+                note("example \"Get cookies.txt LOCALLY\"). ytfx keeps only the"),
+                note("youtube.com cookies, in a private file in ~/.config/ytfx."),
+                Line::raw(""),
+                note("YouTube can rate-limit or flag accounts used by tools like"),
+                note("yt-dlp; a secondary account is the safer choice."),
+            ]);
+        }
+        Some(AccountUi::Path(ref path)) => {
+            lines.extend([
+                note("Path of the exported cookies.txt (~ works):"),
+                Line::from(vec![
+                    Span::styled("> ", Style::new().fg(ACCENT)),
+                    Span::raw(path.as_str()),
+                    Span::styled("▏", Style::new().fg(ACCENT)),
+                ]),
+                Line::raw(""),
+                note("enter import   esc back"),
+            ]);
+        }
+        Some(AccountUi::Browser(sel)) => {
+            for (i, b) in BROWSERS.iter().enumerate() {
+                let style = if i == sel {
+                    Style::new().fg(Color::White).bg(Color::Rgb(70, 10, 20)).bold()
+                } else {
+                    Style::new().fg(Color::Gray)
+                };
+                lines.push(Line::styled(format!("  {b}"), style));
+            }
+            lines.extend([
+                Line::raw(""),
+                note("yt-dlp reads this browser's cookie store every time it"),
+                note("runs. On macOS, Chromium browsers (chrome, edge, brave,"),
+                note("...) ask for Keychain access to decrypt it; Safari needs"),
+                note("Full Disk Access for the terminal; Firefox needs neither."),
+                Line::raw(""),
+                note("enter choose   j/k move   esc back"),
+            ]);
+        }
+    }
+    if let Some((msg, err)) = &app.account_msg {
+        lines.push(Line::raw(""));
+        let color = if *err { ACCENT } else { CHANNEL };
+        lines.push(Line::styled(msg.clone(), Style::new().fg(color)));
+    }
+    // Lines wrap inside the 64-column interior.
+    let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(64)).sum();
+    let rect = centered(f.area(), 66, rows as u16 + 2);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                rounded()
+                    .title(" youtube account ")
+                    .border_style(Style::new().fg(ACCENT)),
+            ),
         rect,
     );
 }

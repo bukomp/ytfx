@@ -26,11 +26,13 @@ Options (`ytfx [options] [search terms | youtube url]`):
 --max-width <n>    max video width in columns for the blocks renderer (default 200)
 --no-sync          start with bass sync off
 --volume <0-200>   start volume in percent (default 80)
+--cookies <file>   use a Netscape cookies.txt for this session only
 --cookies-from-browser <name>
-                   pass browser cookies to yt-dlp (chrome, firefox, safari, ...)
---cookies <file>   pass a Netscape cookies.txt file to yt-dlp
--h, --help         show help
+                   let yt-dlp read this browser's cookies, this session only
+-h, --help         show this help
 ```
+
+The two cookie options are not saved. To stay signed in, press `L` in the app (see Sign-in).
 
 ## Keys
 
@@ -41,21 +43,39 @@ Browser:
 | Key | Action |
 | --- | --- |
 | `/` or `i` | Focus the search box |
-| `enter` | Search (in the box) / play selected result |
+| `enter` | Search (in the box) / play video / open playlist or channel |
+| `ctrl-t` | In the search box: cycle videos / playlists / channels |
+| `t` | In results on the search tab: cycle videos / playlists / channels |
+| `1` `2` `3` `4` `5` | Search, home, subscriptions, library, queue tab |
+| `tab` / `shift-tab` | Next / previous tab (in the search box, `tab` moves to the results) |
 | `j` `k` / `down` `up` | Move selection |
 | `PgUp` `PgDn` | Move selection by 10 |
-| `g` `G` / `Home` `End` | First / last result |
-| `tab` | Switch between search box and results |
+| `g` `G` / `Home` `End` | First / last item |
+| `esc` / `backspace` / `h` / `left` | Go back out of a playlist or channel |
+| `r` | Start radio from the selected video |
+| `R` | Start radio from a random video in this list |
+| `S` | Shuffle-play this list |
+| `a` | Add the selected video to the queue |
+| `x` | Remove the selected item (queue tab) |
+| `u` | Reload this list |
+| `L` | YouTube account (sign in / out) |
+| `v` | Back to the playing video |
+| `space` | Pause / resume while playing |
+| `n` / `N` | Next / previous video while playing |
 | `?` | Help |
 | `q` / `esc` | Quit |
 
-In the search box, `esc` (or `tab` / `down`) moves to the results when there are any; `esc` quits when there are none. Pasting a URL that starts with `http://` or `https://` plays it directly.
+In the search box, `esc` (or `tab` / `down`) moves to the results. Pasting a URL that starts with `http://` or `https://` plays it directly. Pasting a playlist or channel URL opens it as a list.
 
 Player:
 
 | Key | Action |
 | --- | --- |
 | `space` | Pause / resume |
+| `n` / `N` (or `>` / `<`) | Next / previous video in the queue |
+| `m` | Start radio from the playing video |
+| `z` | Shuffle the rest of the queue |
+| `b` / `tab` | Browse while the video keeps playing |
 | `left` `right` | Seek -10 s / +10 s |
 | `up` `down` | Volume up / down |
 | `s` | Toggle bass sync |
@@ -66,7 +86,7 @@ Player:
 | `g` | Switch between pixel graphics and text blocks |
 | `h` | Hide / show HUD |
 | `?` | Help |
-| `q` / `esc` / `backspace` | Back to results |
+| `q` / `esc` / `backspace` | Stop playback and go back |
 | `ctrl-c` | Quit |
 
 Effect keys:
@@ -87,6 +107,48 @@ Presets (`p` / `P`; applying one replaces the current effect set):
 | glitchcore | rgb, glitch, pixel, trails, vhs, shake |
 | dream | blur, trails, zoom, mirror |
 | clean | none |
+
+## Tabs
+
+The browser has five tabs. Press `1` to `5`, or `tab` / `shift-tab`, to switch.
+
+1. Search: search results.
+2. Home: your recommendations.
+3. Subscriptions: the latest videos from channels you subscribe to.
+4. Library: Watch later, Liked videos, History, Your playlists and Subscribed channels.
+5. Queue: the play queue.
+
+Home, subscriptions and library need sign-in.
+
+## Sign-in
+
+Press `L` to open the account dialog. Sign-in persists across runs.
+
+A `cookies.txt` in `~/.config/ytfx/` (or `$XDG_CONFIG_HOME/ytfx/`) is used automatically at startup, also when you copy it there by hand. ytfx removes the lines for sites other than youtube.com and sets the mode to 0600. If the file has no youtube.com sign-in, ytfx starts signed out and shows the reason. A browser chosen with `b` takes priority over the file.
+
+- `f`: import a `cookies.txt` file. Export it from a youtube.com tab with a browser extension (for example "Get cookies.txt LOCALLY"). ytfx keeps only the youtube.com cookies, in `~/.config/ytfx/cookies.txt` (or `$XDG_CONFIG_HOME/ytfx`) with mode 0600. You can delete the exported file afterwards.
+- `b`: let yt-dlp read a browser's cookie store (firefox, chrome, chromium, edge, brave, safari, vivaldi, opera). On macOS, Chromium browsers ask for Keychain access. Safari needs Full Disk Access for the terminal. Firefox needs neither.
+- `o`: sign out and delete the imported cookies.
+
+ytfx never reads browser data unless you pick `b`.
+
+YouTube can rate-limit or flag accounts that tools like yt-dlp use. A secondary account is safer.
+
+`--cookies <file>` and `--cookies-from-browser <name>` apply to one session only. They are not saved.
+
+## Search kinds, queue and radio
+
+Search finds videos, playlists or channels. Cycle the kind with `ctrl-t` in the search box, or `t` in the results. Enter on a playlist or channel opens it as a list. `esc`, `backspace`, `h` or `left` goes back.
+
+Enter on a video in a feed, playlist or channel plays through that list. A video from plain search results plays alone. `a` adds the selected video to the queue, `S` shuffle-plays the current list, and `x` removes an item on the queue tab.
+
+When a video ends, the next one starts. ytfx resolves the next video in the background a few seconds into the current one, so it starts without waiting. If 3 videos in a row fail, the queue stops.
+
+Radio: `r` in the browser starts radio from the selected video. `R` starts it from a random video in the current list. `m` in the player starts it from the playing video. Radio uses YouTube's Mix for that video (related videos), shuffled, and never repeats a video. When fewer than 3 videos are left, it fetches a Mix seeded by a random recently played video. If a video has no Mix, radio falls back to a search for its channel and title.
+
+## Browse while playing
+
+`b` or `tab` in the player goes to the browser while playback continues. A now-playing line shows at the bottom. In the browser, `v` returns to the video, `space` pauses, and `n` / `N` skip to the next / previous video. In the player, `q`, `esc` or `backspace` stops playback and goes back. The HUD shows the queue position (for example `[3/25]`) and a RADIO badge.
 
 ## Resolution
 
@@ -114,20 +176,23 @@ Video frames are scheduled against the audio clock (samples actually played), so
 
 - `src/main.rs`: argument parsing, app state, main loop, key handling
 - `src/youtube.rs`: `yt-dlp` search and stream URL resolution
+- `src/account.rs`: sign-in (cookie import, saved account)
+- `src/queue.rs`: play queue and radio
 - `src/player.rs`: ffmpeg video and audio decoders, A/V sync, seek, resize
 - `src/audio.rs`: cpal output, volume, and the tap of played samples
 - `src/analysis.rs`: FFT, bass level, beat detection
 - `src/effects.rs`: effect pipeline, presets, effect key map
 - `src/kitty.rs`: kitty graphics protocol output (shared memory or inline base64)
-- `src/ui.rs`: ratatui rendering (browser, HUD, help) and the half-block video widget
+- `src/ui.rs`: ratatui rendering (browser, HUD, help, account dialog) and the half-block video widget
 
 ## Troubleshooting
 
 - "Sign in to confirm you're not a bot": YouTube flags some IP addresses (VPNs, datacenters, shared networks). Try these in order:
   1. Update yt-dlp (`brew upgrade yt-dlp`). YouTube changes often and yt-dlp ships fixes often.
   2. Turn off your VPN or try another network.
-  3. Export a `cookies.txt` yourself (ideally from a throwaway Google account) and pass `--cookies cookies.txt`. Only that file is shared, and no browser or Keychain access is needed.
-  4. `--cookies-from-browser <name>` reads your browser's cookie store directly. On macOS, Chromium browsers ask for Keychain access to decrypt it. Use this only if you are comfortable with that.
+  3. Press `L` and choose `f` to import a `cookies.txt` you exported yourself (ideally from a secondary Google account). Only that file is shared, and no browser or Keychain access is needed.
+  4. Press `L` and choose `b` to let yt-dlp read your browser's cookie store. On macOS, Chromium browsers ask for Keychain access to decrypt it. Use this only if you are comfortable with that.
+- "YouTube rejected the cookies" or empty Home / Subscriptions: YouTube rotates the session of a browser that keeps browsing after you export, and the exported copy then stops working. Export from a private window instead: sign in to YouTube, open `https://www.youtube.com/robots.txt` in the same tab, export the youtube.com cookies, and close the private window right away. Then import the file with `L` → `f`, or copy it to `~/.config/ytfx/cookies.txt`.
 - Low resolution: in kitty, Ghostty or WezTerm, press `r`. In other terminals, the blocks renderer is limited by the cell grid (see Resolution).
 - Choppy video: lower the resolution (`R`), `--max-width` or `--fps`.
 - Wrong or banded colors: the terminal probably lacks truecolor support. Use one that has it.

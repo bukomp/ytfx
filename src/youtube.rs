@@ -1,41 +1,241 @@
 //! YouTube access through the `yt-dlp` CLI (no API key needed).
 
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-/// Extra yt-dlp arguments for authentication (cookies), set once from the command line.
-static AUTH_ARGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-pub fn add_auth_arg(flag: &str, value: &str) {
-    let mut args = AUTH_ARGS.lock().unwrap_or_else(|e| e.into_inner());
-    args.push(flag.to_string());
-    args.push(value.to_string());
+/// How yt-dlp authenticates. None when signed out.
+#[derive(Clone, Debug)]
+pub enum Auth {
+    /// A Netscape cookies.txt; each run gets a private copy (see `CookieCopy`).
+    CookiesFile(PathBuf),
+    /// yt-dlp reads this browser's cookie store.
+    Browser(String),
 }
 
-fn yt_dlp() -> Command {
+static AUTH: Mutex<Option<Auth>> = Mutex::new(None);
+static COPIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_auth(auth: Option<Auth>) {
+    *AUTH.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+}
+
+/// yt-dlp saves its cookie jar back to the `--cookies` file when it exits (truncate and
+/// rewrite, no locking), so it never gets the saved file: each run reads a private copy
+/// that is deleted afterwards, and whatever yt-dlp writes back is thrown away.
+struct CookieCopy(PathBuf);
+
+impl CookieCopy {
+    fn new(src: &Path) -> Result<Self> {
+        let data = fs::read(src).with_context(|| format!("can't read {}", src.display()))?;
+        let n = COPIES.fetch_add(1, Relaxed);
+        let path = std::env::temp_dir().join(format!("ytfx-cookies-{}-{n}.txt", std::process::id()));
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .context("can't create a temporary cookie file")?;
+        let copy = CookieCopy(path);
+        f.write_all(&data)?;
+        Ok(copy)
+    }
+}
+
+impl Drop for CookieCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A yt-dlp command for `target`, signed in only when the target is YouTube itself, so
+/// account cookies never go to other sites. Keep the CookieCopy alive while it runs.
+fn yt_dlp(target: &str) -> Result<(Command, Option<CookieCopy>)> {
     let mut cmd = Command::new("yt-dlp");
-    cmd.args(AUTH_ARGS.lock().unwrap_or_else(|e| e.into_inner()).iter());
     cmd.stdin(Stdio::null());
-    cmd
+    let auth = AUTH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut copy = None;
+    if is_youtube_target(target) {
+        match auth {
+            Some(Auth::Browser(b)) => {
+                cmd.arg("--cookies-from-browser").arg(b);
+            }
+            Some(Auth::CookiesFile(src)) => {
+                let c = CookieCopy::new(&src)?;
+                cmd.arg("--cookies").arg(&c.0);
+                copy = Some(c);
+            }
+            None => {}
+        }
+    }
+    Ok((cmd, copy))
 }
 
+/// A yt-dlp search or feed keyword, or an http(s) URL on a YouTube host.
+pub fn is_youtube_target(target: &str) -> bool {
+    if target.starts_with(":yt") || target.starts_with("ytsearch") {
+        return true;
+    }
+    let Some(rest) = target
+        .strip_prefix("https://")
+        .or_else(|| target.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    matches!(
+        host,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be"
+    )
+}
+
+/// Account feeds (need sign-in).
+pub const HOME: &str = ":ytrec";
+pub const SUBSCRIPTIONS: &str = ":ytsubs";
+
+const SITE: &str = "https://www.youtube.com/";
+
+/// Feeds and library pages that only exist for a signed-in account.
+pub fn needs_account(target: &str) -> bool {
+    target.starts_with(':') || target.starts_with("https://www.youtube.com/feed/")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Video,
+    Playlist,
+    Channel,
+}
+
+/// One row of a list: a video, or a playlist / channel that opens into another list.
 #[derive(Debug, Clone)]
-pub struct SearchResult {
-    pub id: String,
+pub struct Entry {
+    pub kind: Kind,
+    /// Video id for videos; for lists a youtube.com URL or a yt-dlp feed keyword.
+    pub target: String,
     pub title: String,
     pub channel: String,
     pub duration: Option<f64>,
     pub views: Option<u64>,
 }
 
-impl SearchResult {
+impl Entry {
     pub fn url(&self) -> String {
-        format!("https://www.youtube.com/watch?v={}", self.id)
+        match self.kind {
+            Kind::Video => format!("{SITE}watch?v={}", self.target),
+            _ => self.target.clone(),
+        }
     }
+
+    /// What to list when this entry is opened (channels open on their uploads).
+    pub fn list_target(&self) -> String {
+        let t = &self.target;
+        let tabbed = ["/videos", "/streams", "/shorts", "/playlists"]
+            .iter()
+            .any(|tab| t.ends_with(tab));
+        if self.kind == Kind::Channel && !tabbed {
+            format!("{}/videos", t.trim_end_matches('/'))
+        } else {
+            list_url(t)
+        }
+    }
+
+    fn folder(title: &str, target: &str) -> Entry {
+        Entry {
+            kind: Kind::Playlist,
+            target: target.into(),
+            title: title.into(),
+            channel: String::new(),
+            duration: None,
+            views: None,
+        }
+    }
+}
+
+/// YouTube won't show Mixes (list ids starting with RD, e.g. "My Mix" RDMM<video id>) as
+/// playlist pages ("This playlist type is unviewable"); they open from a watch page of
+/// their seed video, whose id ends the list id.
+pub fn list_url(url: &str) -> String {
+    let list = url
+        .split(['?', '&'])
+        .find_map(|kv| kv.strip_prefix("list="))
+        .unwrap_or_default();
+    let seed = list.get(list.len().saturating_sub(11)..).unwrap_or_default();
+    if url.starts_with(SITE) && list.starts_with("RD") && list.len() > 11 && is_video_id(seed) {
+        format!("{SITE}watch?v={seed}&list={list}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// The fixed entries of the Library tab.
+pub fn library() -> Vec<Entry> {
+    vec![
+        Entry::folder("Watch later", ":ytwatchlater"),
+        Entry::folder("Liked videos", ":ytfav"),
+        Entry::folder("History", ":ythistory"),
+        Entry::folder("Your playlists", "https://www.youtube.com/feed/playlists"),
+        Entry::folder(
+            "Subscribed channels",
+            "https://www.youtube.com/feed/channels",
+        ),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchKind {
+    Videos,
+    Playlists,
+    Channels,
+}
+
+impl SearchKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchKind::Videos => "videos",
+            SearchKind::Playlists => "playlists",
+            SearchKind::Channels => "channels",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            SearchKind::Videos => SearchKind::Playlists,
+            SearchKind::Playlists => SearchKind::Channels,
+            SearchKind::Channels => SearchKind::Videos,
+        }
+    }
+
+    /// The yt-dlp input that runs this search.
+    pub fn target(self, query: &str, count: usize) -> String {
+        // `sp` is YouTube's result-type filter.
+        let filter = match self {
+            SearchKind::Videos => return format!("ytsearch{count}:{query}"),
+            SearchKind::Playlists => "EgIQAw%3D%3D",
+            SearchKind::Channels => "EgIQAg%3D%3D",
+        };
+        format!("{SITE}results?search_query={}&sp={filter}", encode(query))
+    }
+}
+
+/// Percent-encode a query string value.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -57,11 +257,49 @@ pub struct StreamInfo {
 #[derive(Deserialize)]
 struct FlatEntry {
     id: Option<String>,
+    url: Option<String>,
+    ie_key: Option<String>,
     title: Option<String>,
     channel: Option<String>,
     uploader: Option<String>,
     duration: Option<f64>,
     view_count: Option<f64>,
+}
+
+impl FlatEntry {
+    fn into_entry(self) -> Option<Entry> {
+        let (kind, target) = if self.ie_key.as_deref() == Some("Youtube") {
+            (Kind::Video, self.id.filter(|id| is_video_id(id))?)
+        } else {
+            // Only follow plain youtube.com pages; the URL goes back into yt-dlp.
+            let url = self.url?;
+            let path = url.strip_prefix(SITE)?;
+            if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return None;
+            }
+            let kind = if path.starts_with("playlist?") {
+                Kind::Playlist
+            } else if ["channel/", "@", "c/", "user/"]
+                .iter()
+                .any(|p| path.starts_with(p))
+            {
+                Kind::Channel
+            } else {
+                return None;
+            };
+            (kind, url)
+        };
+        Some(Entry {
+            kind,
+            target,
+            title: self
+                .title
+                .map_or_else(|| "(untitled)".into(), |t| clean(&t)),
+            channel: clean(&self.channel.or(self.uploader).unwrap_or_default()),
+            duration: self.duration,
+            views: self.view_count.map(|v| v as u64),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -82,36 +320,83 @@ struct Format {
     vcodec: Option<String>,
 }
 
-pub fn search(query: &str, count: usize) -> Result<Vec<SearchResult>> {
-    let out = yt_dlp()
+pub fn is_video_id(id: &str) -> bool {
+    id.len() == 11
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Entries of a search, feed, playlist or channel, without resolving each video.
+pub fn list(target: &str, limit: usize) -> Result<Vec<Entry>> {
+    let (mut cmd, _cookies) = yt_dlp(target)?;
+    let out = cmd
         .args([
             "--flat-playlist",
             "--dump-json",
-            "--no-warnings",
             "--ignore-errors",
+            "--playlist-end",
+            &limit.to_string(),
+            "--",
+            target,
         ])
-        .arg(format!("ytsearch{count}:{query}"))
         .output()
         .context("could not run yt-dlp (is it installed and on PATH?)")?;
 
-    let results: Vec<SearchResult> = String::from_utf8_lossy(&out.stdout)
+    let entries: Vec<Entry> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| serde_json::from_str::<FlatEntry>(line).ok())
-        .filter_map(|e| {
-            Some(SearchResult {
-                id: e.id?,
-                title: e.title.map_or_else(|| "(untitled)".into(), |t| clean(&t)),
-                channel: clean(&e.channel.or(e.uploader).unwrap_or_default()),
-                duration: e.duration,
-                views: e.view_count.map(|v| v as u64),
-            })
-        })
+        .filter_map(FlatEntry::into_entry)
         .collect();
 
-    if results.is_empty() && !out.status.success() {
-        bail!("search failed: {}", last_line(&out.stderr));
+    if entries.is_empty() {
+        // Warnings are kept on for this: an empty feed is otherwise all yt-dlp says.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("cookies are no longer valid") {
+            bail!("{COOKIES_ROTATED}");
+        }
+        if !out.status.success() {
+            let err = last_line(&out.stderr);
+            if err.contains("Login details are needed") || err.contains("Sign in to") {
+                bail!("this needs a YouTube account: press L to sign in (or the sign-in expired)");
+            }
+            bail!("yt-dlp: {err}");
+        }
     }
-    Ok(results)
+    Ok(entries)
+}
+
+const COOKIES_ROTATED: &str = "YouTube rejected the cookies: the browser rotated that session after \
+     export. Export again from a private window (sign in, open youtube.com/robots.txt, export, \
+     close the window), then import with L";
+
+/// Videos for radio: YouTube's Mix for `seed` (related videos, starting with it). Some
+/// videos have no Mix; then a search for the seed's channel and title stands in.
+pub fn radio(seed: &Entry, limit: usize) -> Result<Vec<Entry>> {
+    if seed.kind != Kind::Video || !is_video_id(&seed.target) {
+        bail!("radio needs a YouTube video");
+    }
+    let id = &seed.target;
+    let videos = |entries: Vec<Entry>| -> Vec<Entry> {
+        entries
+            .into_iter()
+            .filter(|e| e.kind == Kind::Video)
+            .collect()
+    };
+    let mix = list(&format!("{SITE}watch?v={id}&list=RD{id}"), limit).map(videos);
+    if mix
+        .as_ref()
+        .is_ok_and(|m| m.iter().filter(|e| &e.target != id).count() >= 3)
+    {
+        return mix;
+    }
+    let query = format!("{} {}", seed.channel, seed.title);
+    let found = list(&SearchKind::Videos.target(query.trim(), limit), limit).map(videos);
+    match (mix, found) {
+        (_, Ok(found)) if !found.is_empty() => Ok(found),
+        (Ok(mix), _) => Ok(mix),
+        (Err(e), _) => Err(e),
+    }
 }
 
 /// Resolve a video page URL into direct media stream URLs that ffmpeg can read.
@@ -119,7 +404,8 @@ pub fn resolve(url: &str, max_height: usize) -> Result<StreamInfo> {
     // Best video up to `max_height` (skipping AV1, which is slow to decode) plus best audio.
     let h = max_height;
     let format = format!("bv*[height<={h}][vcodec!^=av01]+ba/bv*[height<={h}]+ba/b[height<={h}]/b");
-    let out = yt_dlp()
+    let (mut cmd, _cookies) = yt_dlp(url)?;
+    let out = cmd
         .args(["-J", "--no-playlist", "--no-warnings", "-f", &format, "--"])
         .arg(url)
         .output()
@@ -128,7 +414,7 @@ pub fn resolve(url: &str, max_height: usize) -> Result<StreamInfo> {
         let err = last_line(&out.stderr);
         if err.contains("not a bot") {
             bail!(
-                "YouTube bot check for this video: try `brew upgrade yt-dlp`, a different network/VPN off, or --cookies <file>"
+                "YouTube bot check for this video: try `brew upgrade yt-dlp`, a different network/VPN off, or signing in (L)"
             );
         }
         bail!("yt-dlp: {err}");
@@ -194,10 +480,11 @@ impl Stream {
 
 fn last_line(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let line = text
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
+    let mut lines = text.lines().rev().filter(|l| !l.trim().is_empty());
+    let line = lines
+        .clone()
+        .find(|l| l.starts_with("ERROR"))
+        .or_else(|| lines.next())
         .unwrap_or("unknown error");
     clean(line.trim())
 }
@@ -205,9 +492,13 @@ fn last_line(stderr: &[u8]) -> String {
 /// Strip control and bidi/zero-width characters from remote text before it reaches the
 /// terminal; ratatui passes ESC through as-is, so a title could otherwise inject escape sequences.
 fn clean(s: &str) -> String {
-    s.chars()
-        .filter(|&c| !c.is_control() && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-        .collect()
+    s.chars().filter(|&c| is_safe_char(c)).collect()
+}
+
+/// Not a control (C0/C1) or bidi/zero-width character.
+pub fn is_safe_char(c: char) -> bool {
+    !c.is_control()
+        && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
@@ -226,5 +517,86 @@ mod tests {
         let crlf = HashMap::from([("User-Agent".to_string(), "x\r\nHost: evil".to_string())]);
         assert!(Stream::new("https://a.b/v".into(), Some(crlf)).is_err());
         assert!(Stream::new("https://a.b/v".into(), None).is_ok());
+    }
+
+    fn flat(json: &str) -> Option<Entry> {
+        serde_json::from_str::<FlatEntry>(json).unwrap().into_entry()
+    }
+
+    #[test]
+    fn flat_entries_are_classified_and_validated() {
+        let v = flat(r#"{"ie_key":"Youtube","id":"dQw4w9WgXcQ","title":"t"}"#).unwrap();
+        assert_eq!((v.kind, v.target.as_str()), (Kind::Video, "dQw4w9WgXcQ"));
+        assert!(flat(r#"{"ie_key":"Youtube","id":"--exec=x"}"#).is_none());
+
+        let p = flat(r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/playlist?list=PL1"}"#);
+        assert_eq!(p.unwrap().kind, Kind::Playlist);
+        let c = flat(r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/channel/UC1"}"#)
+            .unwrap();
+        assert_eq!(c.kind, Kind::Channel);
+        assert_eq!(c.list_target(), "https://www.youtube.com/channel/UC1/videos");
+
+        for bad in [
+            "https://evil.example/playlist?list=PL1",
+            "file:///etc/passwd",
+            "https://www.youtube.com/playlist?list=PL1 --exec x",
+        ] {
+            let json = format!(r#"{{"ie_key":"YoutubeTab","url":"{bad}"}}"#);
+            assert!(flat(&json).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn auth_only_goes_to_youtube() {
+        for t in [
+            ":ytrec",
+            "ytsearch5:x",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://music.youtube.com/playlist?list=PL1",
+        ] {
+            assert!(is_youtube_target(t), "{t}");
+        }
+        for t in [
+            "https://evil.example/youtube.com/@x",
+            "https://www.youtube.com.evil.example/",
+            "https://user@www.youtube.com.evil.example/",
+            "https://www.youtube.com@evil.example/",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_youtube_target(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn cookie_copies_are_private_and_removed() {
+        let src = std::env::temp_dir().join(format!("ytfx-test-src-{}.txt", std::process::id()));
+        fs::write(&src, "x").unwrap();
+        let copy = CookieCopy::new(&src).unwrap();
+        let path = copy.0.clone();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(copy);
+        assert!(!path.exists());
+        fs::remove_file(src).unwrap();
+    }
+
+    #[test]
+    fn mixes_open_from_their_seed_video() {
+        assert_eq!(
+            list_url("https://www.youtube.com/playlist?list=RDMMaObqW1dRVm8"),
+            "https://www.youtube.com/watch?v=aObqW1dRVm8&list=RDMMaObqW1dRVm8"
+        );
+        let normal = "https://www.youtube.com/playlist?list=PLGBKsNyGY-afUo7nfXwctjuJgCtqrYI6Q";
+        assert_eq!(list_url(normal), normal);
+    }
+
+    #[test]
+    fn search_targets() {
+        assert_eq!(SearchKind::Videos.target("a b", 5), "ytsearch5:a b");
+        assert_eq!(
+            SearchKind::Playlists.target("lo-fi & chill", 5),
+            "https://www.youtube.com/results?search_query=lo-fi%20%26%20chill&sp=EgIQAw%3D%3D"
+        );
     }
 }
