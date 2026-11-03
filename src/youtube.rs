@@ -431,6 +431,20 @@ pub fn is_video_id(id: &str) -> bool {
 
 /// Entries of a search, feed, playlist or channel, without resolving each video.
 pub fn list(target: &str, limit: usize) -> Result<Vec<Entry>> {
+    match list_once(target, limit) {
+        // Auto-generated "Artist - Topic" channels have no Videos tab; their bare channel
+        // page lists the uploads instead.
+        Err(e) if e.to_string().contains("does not have a videos tab") => {
+            match target.strip_suffix("/videos") {
+                Some(bare) => list_once(bare, limit),
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
+fn list_once(target: &str, limit: usize) -> Result<Vec<Entry>> {
     let (mut cmd, _cookies) = yt_dlp(target)?;
     let out = cmd
         .args([
@@ -722,5 +736,17 @@ mod tests {
             SearchKind::Playlists.target("lo-fi & chill", 5),
             "https://www.youtube.com/results?search_query=lo-fi%20%26%20chill&sp=EgIQAw%3D%3D"
         );
+    }
+
+    /// Needs network: `cargo test topic_channel -- --ignored`
+    #[test]
+    #[ignore]
+    fn topic_channel_lists_uploads() {
+        let topic = flat(
+            r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/channel/UCRr1xG_2WIDs18a6cIiCxeA"}"#,
+        )
+        .unwrap();
+        let entries = list(&topic.list_target(), 5).unwrap();
+        assert!(!entries.is_empty() && entries.iter().all(|e| e.kind == Kind::Video));
     }
 }
