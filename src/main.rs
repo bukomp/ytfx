@@ -4,6 +4,7 @@ mod audio;
 mod effects;
 mod kitty;
 mod player;
+mod preview;
 mod queue;
 mod settings;
 mod ui;
@@ -155,7 +156,9 @@ fn parse_args() -> Result<Config> {
                     / 100.0
             }
             "--cookies-from-browser" => {
-                let name = args.next().context("--cookies-from-browser needs a value")?;
+                let name = args
+                    .next()
+                    .context("--cookies-from-browser needs a value")?;
                 cfg.auth = Some(youtube::Auth::Browser(name));
             }
             "--cookies" => {
@@ -262,7 +265,7 @@ impl ListView {
         v
     }
 
-    fn selected(&self) -> Option<(usize, &Entry)> {
+    pub fn selected(&self) -> Option<(usize, &Entry)> {
         let i = self.state.selected()?;
         Some((i, self.entries.get(i)?))
     }
@@ -281,6 +284,8 @@ enum Msg {
     Listed(u64, Result<Vec<Entry>>),
     Resolved(u64, Result<StreamInfo>),
     Mix(u64, Result<Vec<Entry>>),
+    /// A preview thumbnail: its URL, decode size and pixels.
+    Thumb(String, (usize, usize), Result<Vec<u8>>),
 }
 
 /// The next queued video, resolved ahead of time so it starts without a wait.
@@ -360,6 +365,13 @@ pub struct App {
     pub cell_aspect: f64,
     /// Where ui::draw placed the video this frame (graphics renderer only).
     pub image_rect: Option<Rect>,
+    /// Preview pane next to the browser lists (when the terminal is wide enough).
+    pub show_preview: bool,
+    pub thumbs: preview::Thumbs,
+    /// Set by ui::draw: the thumbnail the pane shows and its decode size.
+    pub preview_want: Option<(String, (usize, usize))>,
+    /// Set by ui::draw: where the graphics renderer should put that thumbnail.
+    pub preview_image: Option<(Rect, String)>,
     pub ticks: u64,
     area: Rect,
     tap: Vec<f32>,
@@ -436,6 +448,10 @@ impl App {
             res: cfg.res,
             cell_aspect: 2.0,
             image_rect: None,
+            show_preview: true,
+            thumbs: preview::Thumbs::default(),
+            preview_want: None,
+            preview_image: None,
             ticks: 0,
             area: Rect::default(),
             tap: Vec::new(),
@@ -477,6 +493,7 @@ impl App {
                 Msg::Listed(token, result) => self.on_listed(token, result),
                 Msg::Resolved(token, result) => self.on_resolved(token, result),
                 Msg::Mix(token, result) => self.on_mix(token, result),
+                Msg::Thumb(url, size, result) => self.thumbs.done(url, size, result),
             }
         }
     }
@@ -603,6 +620,7 @@ impl App {
                     channel: String::new(),
                     duration: None,
                     views: None,
+                    meta: Default::default(),
                 };
                 self.play_entries(&[entry], 0);
             }
@@ -959,7 +977,9 @@ impl App {
             AccountUi::Browser(i) => match k.code {
                 KeyCode::Esc => *ui = AccountUi::Menu,
                 KeyCode::Up | KeyCode::Char('k') => *i = i.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => *i = (*i + 1).min(account::BROWSERS.len() - 1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *i = (*i + 1).min(account::BROWSERS.len() - 1)
+                }
                 KeyCode::Enter => {
                     let account = Account::Browser(account::BROWSERS[*i].into());
                     let result = account::save(&account).map(|()| {
@@ -979,6 +999,20 @@ impl App {
         self.ticks += 1;
         self.area = area;
         self.poll_messages();
+        let want = self.preview_want.clone();
+        if let Some(url) = self
+            .thumbs
+            .poll(want.as_ref().map(|w| w.0.as_str()), Instant::now())
+        {
+            let size = want.map_or(preview::WIDE, |w| w.1);
+            self.spawn(
+                move || {
+                    let result = preview::fetch(&url, size);
+                    (url, size, result)
+                },
+                |_, (url, size, result)| Msg::Thumb(url, size, result),
+            );
+        }
         if self.active {
             self.refill_radio();
             self.prefetch_next();
@@ -1130,6 +1164,7 @@ impl App {
         // --no-sync on the command line wins over the saved choice.
         self.sync = self.sync && s.sync.unwrap_or(true);
         self.fill = s.fill.unwrap_or(true);
+        self.show_preview = s.preview.unwrap_or(true);
     }
 
     fn save_settings(&mut self) {
@@ -1145,6 +1180,7 @@ impl App {
             intensity: Some((self.effects.intensity * 10.0).round() / 10.0),
             sync: Some(self.sync),
             fill: Some(self.fill),
+            preview: Some(self.show_preview),
         };
         if let Err(e) = settings::save(&s) {
             self.status = Some((format!("couldn't save settings: {e:#}"), true));
@@ -1273,9 +1309,7 @@ impl App {
         let depth = self.tabs[self.tab as usize].len();
         match k.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h')
-                if depth > 1 =>
-            {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') if depth > 1 => {
                 self.tabs[self.tab as usize].pop();
             }
             KeyCode::Esc => self.quit = true,
@@ -1320,6 +1354,10 @@ impl App {
                 self.account_msg = None;
             }
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('p') => {
+                self.show_preview = !self.show_preview;
+                self.save_settings();
+            }
             // Playback continues while browsing.
             KeyCode::Char('v') if self.active => self.show_video = true,
             KeyCode::Char(' ') if self.player.is_some() => {
@@ -1433,9 +1471,7 @@ impl App {
             KeyCode::Char('m') => {
                 match self.queue.current().cloned() {
                     Some(e) if self.player.is_some() => self.start_radio(e, false),
-                    _ => {
-                        self.status = Some(("radio needs a playing YouTube video".into(), false))
-                    }
+                    _ => self.status = Some(("radio needs a playing YouTube video".into(), false)),
                 }
                 return;
             }
@@ -1466,12 +1502,8 @@ impl App {
             KeyCode::Char('P') => {
                 self.set_preset((self.preset + PRESETS.len() - 1) % PRESETS.len())
             }
-            KeyCode::Char('[') => {
-                self.effects.intensity = (self.effects.intensity - 0.1).max(0.1)
-            }
-            KeyCode::Char(']') => {
-                self.effects.intensity = (self.effects.intensity + 0.1).min(2.0)
-            }
+            KeyCode::Char('[') => self.effects.intensity = (self.effects.intensity - 0.1).max(0.1),
+            KeyCode::Char(']') => self.effects.intensity = (self.effects.intensity + 0.1).min(2.0),
             KeyCode::Char(c) if Fx::from_key(c).is_some() => {
                 if let Some(fx) = Fx::from_key(c) {
                     self.effects.toggle(fx);
@@ -1518,6 +1550,10 @@ impl App {
             self.queue_state.offset(),
         )
             .hash(&mut h);
+        // The preview pane's text changes with the selection.
+        if self.show_preview && !self.show_video {
+            (view.state.selected(), self.queue_state.selected()).hash(&mut h);
+        }
         (
             self.busy.is_some(),
             self.show_help,
@@ -1581,6 +1617,8 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
         // Synchronized output stops the terminal from showing half-drawn frames.
         queue!(term.backend_mut(), BeginSynchronizedUpdate)?;
         app.image_rect = None;
+        app.preview_want = None;
+        app.preview_image = None;
         term.draw(|f| ui::draw(f, app))?;
         // ratatui only rewrites cells it thinks changed. Titles with characters whose
         // width the terminal sees differently (ambiguous-width symbols, some emoji) shift
@@ -1590,7 +1628,12 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
         if layout != last_layout {
             last_layout = layout;
             term.clear()?;
+            if let Some(k) = app.kitty.as_mut() {
+                k.forget();
+            }
             app.image_rect = None;
+            app.preview_want = None;
+            app.preview_image = None;
             term.draw(|f| ui::draw(f, app))?;
         }
         draw_image(term, app)?;
@@ -1620,17 +1663,26 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Graphics renderer: put the processed frame where ui::draw left room for it.
+/// Graphics renderer: put the processed frame (or the preview thumbnail) where ui::draw
+/// left room for it.
 fn draw_image(term: &mut Term, app: &mut App) -> Result<()> {
     let Some(kitty) = app.kitty.as_mut() else {
         return Ok(());
     };
     let out = term.backend_mut();
     let (w, h) = app.frame_dims;
-    match app.image_rect {
-        Some(rect) if w > 0 && app.frame_out.len() >= w * h * 3 => {
+    let thumb = app
+        .preview_image
+        .as_ref()
+        .and_then(|(rect, url)| match app.thumbs.get(url) {
+            Some(preview::Slot::Ready(t)) => Some((*rect, t)),
+            _ => None,
+        });
+    match (app.image_rect, thumb) {
+        (Some(rect), _) if w > 0 && app.frame_out.len() >= w * h * 3 => {
             kitty.draw(out, rect, &app.frame_out, w, h)?
         }
+        (None, Some((rect, t))) => kitty.draw_still(out, rect, &t.data, (t.w, t.h), t.id)?,
         _ => kitty.clear(out)?,
     }
     Ok(())
@@ -1705,7 +1757,10 @@ mod tests {
     fn video_ids_from_urls() {
         let id = Some("dQw4w9WgXcQ".to_string());
         assert_eq!(video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), id);
-        assert_eq!(video_id("https://youtube.com/watch?list=RD1&v=dQw4w9WgXcQ&t=3"), id);
+        assert_eq!(
+            video_id("https://youtube.com/watch?list=RD1&v=dQw4w9WgXcQ&t=3"),
+            id
+        );
         assert_eq!(video_id("https://youtu.be/dQw4w9WgXcQ?si=x"), id);
         assert_eq!(video_id("https://m.youtube.com/shorts/dQw4w9WgXcQ"), id);
         assert_eq!(video_id("https://vimeo.com/watch?v=dQw4w9WgXcQ"), None);

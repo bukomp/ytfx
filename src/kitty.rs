@@ -28,6 +28,8 @@ pub struct Kitty {
     counter: u64,
     recent: VecDeque<CString>,
     shown: bool,
+    /// The still image on screen (see `draw_still`) and where.
+    still: Option<(u64, Rect)>,
 }
 
 impl Kitty {
@@ -52,6 +54,7 @@ impl Kitty {
             counter: 0,
             recent: VecDeque::new(),
             shown: false,
+            still: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl Kitty {
         w: usize,
         h: usize,
     ) -> io::Result<()> {
+        self.still = None;
         // z=-1 puts the image under text, so overlays drawn by ratatui stay readable.
         let ctrl = format!(
             "a=T,f=24,s={w},v={h},i={IMAGE_ID},p=1,c={},r={},C=1,z=-1,q=2",
@@ -100,8 +104,32 @@ impl Kitty {
         Ok(())
     }
 
+    /// Like `draw`, for an image that doesn't change: it is only sent when `key` (unique
+    /// per image) or `rect` differ from what is already on screen.
+    pub fn draw_still(
+        &mut self,
+        out: &mut impl Write,
+        rect: Rect,
+        data: &[u8],
+        (w, h): (usize, usize),
+        key: u64,
+    ) -> io::Result<()> {
+        if self.still == Some((key, rect)) {
+            return Ok(());
+        }
+        self.draw(out, rect, data, w, h)?;
+        self.still = Some((key, rect));
+        Ok(())
+    }
+
+    /// The screen was cleared, which may have removed the image: send it again next time.
+    pub fn forget(&mut self) {
+        self.still = None;
+    }
+
     /// Remove the image (leaving the player, opening an overlay).
     pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.still = None;
         if self.shown {
             write!(out, "\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\")?;
             self.shown = false;

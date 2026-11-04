@@ -47,7 +47,8 @@ impl CookieCopy {
     fn new(src: &Path) -> Result<Self> {
         let data = fs::read(src).with_context(|| format!("can't read {}", src.display()))?;
         let n = COPIES.fetch_add(1, Relaxed);
-        let path = std::env::temp_dir().join(format!("ytfx-cookies-{}-{n}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ytfx-cookies-{}-{n}.txt", std::process::id()));
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -227,6 +228,24 @@ pub struct Entry {
     pub channel: String,
     pub duration: Option<f64>,
     pub views: Option<u64>,
+    /// Extra details for the preview pane.
+    pub meta: Meta,
+}
+
+/// What the preview pane shows beyond the list row. Everything is optional: feeds and
+/// search results fill in different parts.
+#[derive(Debug, Clone, Default)]
+pub struct Meta {
+    /// A thumbnail (videos, playlists) or avatar (channels) on a YouTube image host.
+    pub thumbnail: Option<String>,
+    /// The snippet YouTube shows in search results.
+    pub description: Option<String>,
+    pub live: bool,
+    /// Viewers right now, for live streams.
+    pub watching: Option<u64>,
+    pub followers: Option<u64>,
+    /// The channel's @handle.
+    pub handle: Option<String>,
 }
 
 impl Entry {
@@ -235,6 +254,15 @@ impl Entry {
             Kind::Video => format!("{SITE}watch?v={}", self.target),
             _ => self.target.clone(),
         }
+    }
+
+    /// The image the preview pane shows; videos without one in the listing use the
+    /// standard thumbnail for their id.
+    pub fn thumbnail_url(&self) -> Option<String> {
+        self.meta.thumbnail.clone().or_else(|| {
+            (self.kind == Kind::Video && is_video_id(&self.target))
+                .then(|| format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", self.target))
+        })
     }
 
     /// What to list when this entry is opened (channels open on their uploads).
@@ -258,6 +286,7 @@ impl Entry {
             channel: String::new(),
             duration: None,
             views: None,
+            meta: Meta::default(),
         }
     }
 }
@@ -270,7 +299,9 @@ pub fn list_url(url: &str) -> String {
         .split(['?', '&'])
         .find_map(|kv| kv.strip_prefix("list="))
         .unwrap_or_default();
-    let seed = list.get(list.len().saturating_sub(11)..).unwrap_or_default();
+    let seed = list
+        .get(list.len().saturating_sub(11)..)
+        .unwrap_or_default();
     if url.starts_with(SITE) && list.starts_with("RD") && list.len() > 11 && is_video_id(seed) {
         format!("{SITE}watch?v={seed}&list={list}")
     } else {
@@ -366,6 +397,53 @@ struct FlatEntry {
     uploader: Option<String>,
     duration: Option<f64>,
     view_count: Option<f64>,
+    #[serde(default)]
+    thumbnails: Vec<Thumbnail>,
+    description: Option<String>,
+    live_status: Option<String>,
+    concurrent_view_count: Option<f64>,
+    channel_follower_count: Option<f64>,
+    uploader_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Thumbnail {
+    url: String,
+    width: Option<f64>,
+}
+
+/// The smallest listed image that is at least 320 pixels wide (the preview decodes at
+/// that size), else the largest. Only https URLs on YouTube's image hosts are kept.
+fn pick_thumbnail(thumbs: &[Thumbnail]) -> Option<String> {
+    let mut usable: Vec<(f64, String)> = thumbs
+        .iter()
+        .filter_map(|t| Some((t.width.unwrap_or(0.0), image_url(&t.url)?)))
+        .collect();
+    usable.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let i = usable.iter().position(|(w, _)| *w >= 320.0);
+    let i = i.unwrap_or(usable.len().checked_sub(1)?);
+    Some(usable.swap_remove(i).1)
+}
+
+/// `url` as an https URL if it points at a YouTube image host, else None. The URL goes
+/// to ffmpeg, so anything odd in it is refused.
+pub fn image_url(url: &str) -> Option<String> {
+    let url = match url.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
+    };
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let ok_host = host == "yt3.ggpht.com"
+        || host == "yt3.googleusercontent.com"
+        || host
+            .strip_suffix(".ytimg.com")
+            .is_some_and(|sub| !sub.is_empty() && sub.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let clean = url.len() < 2048
+        && url
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b'\''));
+    (ok_host && clean).then_some(url)
 }
 
 impl FlatEntry {
@@ -400,6 +478,20 @@ impl FlatEntry {
             channel: clean(&self.channel.or(self.uploader).unwrap_or_default()),
             duration: self.duration,
             views: self.view_count.map(|v| v as u64),
+            meta: Meta {
+                thumbnail: pick_thumbnail(&self.thumbnails),
+                description: self
+                    .description
+                    .map(|d| clean(&d.replace(['\n', '\r'], " ")))
+                    .filter(|d| !d.trim().is_empty()),
+                live: self.live_status.as_deref() == Some("is_live"),
+                watching: self.concurrent_view_count.map(|v| v as u64),
+                followers: self.channel_follower_count.map(|v| v as u64),
+                handle: self
+                    .uploader_id
+                    .filter(|h| h.starts_with('@'))
+                    .map(|h| clean(&h)),
+            },
         })
     }
 }
@@ -638,7 +730,9 @@ mod tests {
     }
 
     fn flat(json: &str) -> Option<Entry> {
-        serde_json::from_str::<FlatEntry>(json).unwrap().into_entry()
+        serde_json::from_str::<FlatEntry>(json)
+            .unwrap()
+            .into_entry()
     }
 
     #[test]
@@ -647,12 +741,16 @@ mod tests {
         assert_eq!((v.kind, v.target.as_str()), (Kind::Video, "dQw4w9WgXcQ"));
         assert!(flat(r#"{"ie_key":"Youtube","id":"--exec=x"}"#).is_none());
 
-        let p = flat(r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/playlist?list=PL1"}"#);
+        let p =
+            flat(r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/playlist?list=PL1"}"#);
         assert_eq!(p.unwrap().kind, Kind::Playlist);
-        let c = flat(r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/channel/UC1"}"#)
-            .unwrap();
+        let c =
+            flat(r#"{"ie_key":"YoutubeTab","url":"https://www.youtube.com/channel/UC1"}"#).unwrap();
         assert_eq!(c.kind, Kind::Channel);
-        assert_eq!(c.list_target(), "https://www.youtube.com/channel/UC1/videos");
+        assert_eq!(
+            c.list_target(),
+            "https://www.youtube.com/channel/UC1/videos"
+        );
 
         for bad in [
             "https://evil.example/playlist?list=PL1",
@@ -662,6 +760,44 @@ mod tests {
             let json = format!(r#"{{"ie_key":"YoutubeTab","url":"{bad}"}}"#);
             assert!(flat(&json).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn thumbnails_only_come_from_youtube_image_hosts() {
+        assert_eq!(
+            image_url("//yt3.ggpht.com/abc=s176").as_deref(),
+            Some("https://yt3.ggpht.com/abc=s176")
+        );
+        assert!(image_url("https://i.ytimg.com/vi/x/hq720.jpg?sqp=a&rs=b").is_some());
+        for bad in [
+            "http://i.ytimg.com/vi/x/a.jpg",
+            "https://evil.example/i.ytimg.com/a.jpg",
+            "https://i.ytimg.com.evil.example/a.jpg",
+            "https://a.b.ytimg.com/a.jpg",
+            "https://i.ytimg.com/a b.jpg",
+            "file:///etc/passwd",
+        ] {
+            assert!(image_url(bad).is_none(), "{bad}");
+        }
+        let e = flat(
+            r#"{"ie_key":"Youtube","id":"dQw4w9WgXcQ","live_status":"is_live","thumbnails":[
+                {"url":"https://i.ytimg.com/vi/dQw4w9WgXcQ/s.jpg","width":168},
+                {"url":"https://i.ytimg.com/vi/dQw4w9WgXcQ/m.jpg","width":360},
+                {"url":"https://i.ytimg.com/vi/dQw4w9WgXcQ/l.jpg","width":720}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            e.thumbnail_url().unwrap(),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/m.jpg"
+        );
+        assert!(e.meta.live);
+        // No usable listed image: videos fall back to the standard one.
+        let e = flat(r#"{"ie_key":"Youtube","id":"dQw4w9WgXcQ","thumbnails":[{"url":"https://x.example/a"}]}"#)
+            .unwrap();
+        assert_eq!(
+            e.thumbnail_url().unwrap(),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+        );
     }
 
     #[test]
@@ -693,7 +829,10 @@ mod tests {
         let copy = CookieCopy::new(&src).unwrap();
         let path = copy.path.clone();
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         drop(copy);
         assert!(!path.exists());
         fs::remove_file(src).unwrap();
@@ -713,7 +852,11 @@ mod tests {
     fn refreshed_youtube_cookies_are_merged_back() {
         let line = |d: &str, n: &str, v: &str| format!("{d}\tTRUE\t/\tTRUE\t1900000000\t{n}\t{v}");
         let header = "# Netscape HTTP Cookie File\n";
-        let current = format!("{header}{}\n{}\n", line(".youtube.com", "SID", "a"), line(".youtube.com", "SIDCC", "old"));
+        let current = format!(
+            "{header}{}\n{}\n",
+            line(".youtube.com", "SID", "a"),
+            line(".youtube.com", "SIDCC", "old")
+        );
         let before = current.clone();
         let after = format!(
             "{header}{}\n{}\n{}\n{}\n",

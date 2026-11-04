@@ -153,6 +153,7 @@ mod tests {
             channel: String::new(),
             duration: None,
             views: None,
+            meta: Default::default(),
         }
     }
 
@@ -163,7 +164,13 @@ mod tests {
     #[test]
     fn set_skips_non_videos_and_keeps_the_selection() {
         let mut list = vec![video("a"), video("b"), video("c")];
-        list.insert(1, Entry { kind: Kind::Playlist, ..video("p") });
+        list.insert(
+            1,
+            Entry {
+                kind: Kind::Playlist,
+                ..video("p")
+            },
+        );
         let mut q = Queue::default();
         q.set(&list, 2);
         assert_eq!(ids(&q), ["a", "b", "c"]);

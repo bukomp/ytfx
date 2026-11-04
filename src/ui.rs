@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Widg
 
 use crate::account::BROWSERS;
 use crate::effects::{Fx, PRESETS};
+use crate::preview::{self, Slot};
 use crate::youtube::{Entry, Kind};
 use crate::{AccountUi, App, Focus, RES_STEPS, Renderer, Tab};
 
@@ -16,6 +17,8 @@ const DIM: Color = Color::Rgb(95, 95, 110);
 const CHANNEL: Color = Color::Rgb(120, 180, 255);
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Narrower lists than this get no preview pane.
+const PREVIEW_MIN_WIDTH: u16 = 90;
 
 /// The part of the screen the video may use (everything above the HUD).
 pub fn video_area(area: Rect) -> Rect {
@@ -66,6 +69,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_browser(f, app);
     }
     let waiting = (app.show_video && loading).then(|| "buffering".to_string());
+    // Overlays hide the preview image, which would cover their background.
+    if waiting.is_some() || app.busy.is_some() || app.account_ui.is_some() || app.show_help {
+        app.preview_image = None;
+    }
     if let Some(msg) = app.busy.as_ref().or(waiting.as_ref()) {
         let spin = SPINNER[(app.ticks / 2) as usize % SPINNER.len()];
         let text = format!(" {spin} {msg} ");
@@ -112,7 +119,10 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     ];
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let style = if *tab == app.tab {
-            Style::new().fg(Color::White).bg(Color::Rgb(70, 10, 20)).bold()
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Rgb(70, 10, 20))
+                .bold()
         } else {
             Style::new().fg(DIM)
         };
@@ -162,10 +172,21 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     }
 
     let border = Style::new().fg(if search_focused { DIM } else { ACCENT });
+    let (list, pane) = if app.show_preview && list.width >= PREVIEW_MIN_WIDTH {
+        let width = (list.width * 2 / 5).clamp(36, 72);
+        let [list, pane] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(width)]).areas(list);
+        (list, Some(pane))
+    } else {
+        (list, None)
+    };
     if app.tab == Tab::Queue {
         draw_queue(f, app, list, border);
     } else {
         draw_list(f, app, list, border);
+    }
+    if let Some(pane) = pane {
+        draw_preview(f, app, pane);
     }
 
     if app.active {
@@ -317,6 +338,162 @@ fn entry_item(e: &Entry, playing: Option<bool>) -> ListItem<'_> {
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// The selected entry's thumbnail and details, to the right of the list.
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = rounded()
+        .title(" preview ")
+        .border_style(Style::new().fg(DIM));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let entry = if app.tab == Tab::Queue {
+        app.queue_state
+            .selected()
+            .and_then(|i| app.queue.items.get(i))
+    } else {
+        app.view().selected().map(|(_, e)| e)
+    };
+    let Some(e) = entry.cloned() else {
+        return;
+    };
+
+    // Thumbnail on top, at most half the pane, keeping its aspect ratio.
+    let size = match e.kind {
+        Kind::Channel => preview::SQUARE,
+        _ => preview::WIDE,
+    };
+    let mut text_area = inner;
+    if inner.height >= 8 {
+        let room = Rect {
+            height: inner.height / 2,
+            ..inner
+        };
+        let img = Rect {
+            y: inner.y,
+            ..fit_cells(room, size.0 as f64 / size.1 as f64, app.cell_aspect)
+        };
+        draw_thumbnail(f, app, &e, img, size);
+        text_area.y = img.bottom() + 1;
+        text_area.height = inner.bottom().saturating_sub(text_area.y);
+    }
+
+    let hint = match (app.tab, e.kind) {
+        (Tab::Queue, _) => "enter play   x remove",
+        (_, Kind::Video) => "enter play   r radio   a queue",
+        (_, Kind::Playlist) => "enter open",
+        (_, Kind::Channel) => "enter open uploads",
+    };
+    if text_area.height > 1 {
+        let hint_row = Rect {
+            y: text_area.bottom() - 1,
+            height: 1,
+            ..text_area
+        };
+        f.render_widget(Paragraph::new(hint).fg(DIM), hint_row);
+        text_area.height -= 1;
+    }
+    f.render_widget(
+        Paragraph::new(preview_lines(&e)).wrap(ratatui::widgets::Wrap { trim: true }),
+        text_area,
+    );
+}
+
+/// The thumbnail in `rect`: pixels for the graphics renderer (drawn by main after
+/// ratatui), half blocks otherwise, or a placeholder while it loads.
+fn draw_thumbnail(f: &mut Frame, app: &mut App, e: &Entry, rect: Rect, size: (usize, usize)) {
+    let url = e.thumbnail_url();
+    if let Some(url) = &url {
+        app.preview_want = Some((url.clone(), size));
+    }
+    let placeholder = match url.as_deref().map(|u| (u, app.thumbs.get(u))) {
+        Some((url, Some(Slot::Ready(t)))) => {
+            if app.renderer == Renderer::Kitty {
+                app.preview_image = Some((rect, url.to_string()));
+            } else {
+                let (w, h) = (rect.width as usize, rect.height as usize * 2);
+                let data = preview::resample(&t.data, t.w, t.h, w, h);
+                f.render_widget(HalfBlocks { data: &data, w, h }, rect);
+            }
+            return;
+        }
+        Some((_, Some(Slot::Failed))) | None => "no image".to_string(),
+        Some(_) => SPINNER[(app.ticks / 2) as usize % SPINNER.len()].to_string(),
+    };
+    f.render_widget(Block::new().bg(Color::Rgb(22, 22, 28)), rect);
+    f.render_widget(
+        Paragraph::new(placeholder)
+            .fg(DIM)
+            .alignment(Alignment::Center),
+        centered(rect, rect.width, 1),
+    );
+}
+
+/// Kind badge, title, channel, numbers and description.
+fn preview_lines(e: &Entry) -> Vec<Line<'_>> {
+    let (label, color) = match e.kind {
+        Kind::Video => ("VIDEO", Color::Gray),
+        Kind::Playlist => ("PLAYLIST", ACCENT),
+        Kind::Channel => ("CHANNEL", CHANNEL),
+    };
+    let mut badge = vec![Span::styled(
+        format!(" {label} "),
+        Style::new().fg(Color::Black).bg(color).bold(),
+    )];
+    if e.meta.live {
+        badge.push(Span::raw(" "));
+        badge.push(Span::styled(
+            " ● LIVE ",
+            Style::new().fg(Color::White).bg(ACCENT).bold(),
+        ));
+    }
+    let mut lines = vec![
+        Line::from(badge),
+        Line::raw(""),
+        Line::styled(e.title.as_str(), Style::new().fg(Color::White).bold()),
+    ];
+
+    let mut who = Vec::new();
+    if e.kind != Kind::Channel && !e.channel.is_empty() {
+        who.push(Span::styled(e.channel.as_str(), Style::new().fg(CHANNEL)));
+    }
+    if let Some(handle) = &e.meta.handle {
+        if !who.is_empty() {
+            who.push(Span::raw("  "));
+        }
+        who.push(Span::styled(handle.as_str(), Style::new().fg(DIM)));
+    }
+    if !who.is_empty() {
+        lines.push(Line::from(who));
+    }
+
+    let mut stats = Vec::new();
+    if let Some(d) = e.duration {
+        stats.push(fmt_time(d));
+    }
+    if let Some(v) = e.views {
+        stats.push(format!("{} views", fmt_count(v)));
+    }
+    if let Some(w) = e.meta.watching {
+        stats.push(format!("{} watching", fmt_count(w)));
+    }
+    if let Some(n) = e.meta.followers {
+        stats.push(format!("{} subscribers", fmt_count(n)));
+    }
+    if !stats.is_empty() {
+        lines.push(Line::styled(
+            stats.join(" · "),
+            Style::new().fg(Color::Gray),
+        ));
+    }
+    if let Some(d) = &e.meta.description {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            d.as_str(),
+            Style::new().fg(Color::Rgb(150, 150, 165)),
+        ));
+    }
+    lines
 }
 
 /// One line at the bottom of the browser while something plays in the background.
@@ -564,6 +741,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("a", "add the selected video to the queue"),
             ("x", "remove from the queue (queue tab)"),
             ("u", "reload this list"),
+            ("p", "preview pane on / off (wide terminals)"),
             ("L", "YouTube account (sign in / out)"),
             ("v", "back to the playing video"),
             ("space / n / N", "pause, next, previous while playing"),
@@ -654,7 +832,10 @@ fn draw_account(f: &mut Frame, app: &App) {
         Some(AccountUi::Browser(sel)) => {
             for (i, b) in BROWSERS.iter().enumerate() {
                 let style = if i == sel {
-                    Style::new().fg(Color::White).bg(Color::Rgb(70, 10, 20)).bold()
+                    Style::new()
+                        .fg(Color::White)
+                        .bg(Color::Rgb(70, 10, 20))
+                        .bold()
                 } else {
                     Style::new().fg(Color::Gray)
                 };

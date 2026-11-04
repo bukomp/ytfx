@@ -58,6 +58,7 @@ Browser:
 | `a` | Add the selected video to the queue |
 | `x` | Remove the selected item (queue tab) |
 | `u` | Reload this list |
+| `p` | Show or hide the preview pane (thumbnail and details of the selected row; needs a list at least 90 columns wide) |
 | `L` | YouTube account (sign in / out) |
 | `v` | Back to the playing video |
 | `space` | Pause / resume while playing |

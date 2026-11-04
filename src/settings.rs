@@ -1,6 +1,6 @@
-//! Player settings that survive restarts: which effects are on, preset, intensity, bass
-//! sync and the background fill. Saved to `settings.json` in the config directory
-//! whenever one of them changes.
+//! Settings that survive restarts: which effects are on, preset, intensity, bass sync,
+//! the background fill and the browser's preview pane. Saved to `settings.json` in the
+//! config directory whenever one of them changes.
 
 use std::fs;
 
@@ -18,6 +18,8 @@ pub struct Settings {
     pub intensity: Option<f32>,
     pub sync: Option<bool>,
     pub fill: Option<bool>,
+    /// The browser's preview pane.
+    pub preview: Option<bool>,
 }
 
 /// The saved settings; anything missing or unreadable falls back to the defaults.
