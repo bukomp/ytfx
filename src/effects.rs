@@ -194,7 +194,9 @@ impl Effects {
             vignette_size: (0, 0),
             noise: {
                 let mut r = Rng::new(0x51f1_5eed);
-                (0..NOISE_LEN).map(|_| (r.signed() * 256.0) as i16).collect()
+                (0..NOISE_LEN)
+                    .map(|_| (r.signed() * 256.0) as i16)
+                    .collect()
             },
             sums: Vec::new(),
         };
@@ -435,7 +437,10 @@ fn box_blur(buf: &mut [u8], tmp: &mut [u8], sums: &mut Vec<u32>, w: usize, h: us
         for (d, &s) in dst.iter_mut().zip(sums.iter()) {
             *d = ((s * recip) >> 16) as u8;
         }
-        let (add, sub) = (line(y as isize + r as isize + 1), line(y as isize - r as isize));
+        let (add, sub) = (
+            line(y as isize + r as isize + 1),
+            line(y as isize - r as isize),
+        );
         for ((s, &a), &b) in sums.iter_mut().zip(add).zip(sub) {
             *s = *s + a as u32 - b as u32;
         }
@@ -684,7 +689,11 @@ pub fn content_rect(frame: &[u8], w: usize, h: usize) -> Crop {
     let x0 = if left >= min_x { left } else { 0 };
     let x1 = if w - right >= min_x { right } else { w };
     let y0 = if top >= min_y { top } else { 0 };
-    let y1 = if h - (bottom + 1) >= min_y { bottom + 1 } else { h };
+    let y1 = if h - (bottom + 1) >= min_y {
+        bottom + 1
+    } else {
+        h
+    };
     // A tiny picture is more likely a dark scene with one bright spot than real bars.
     if (x1 - x0) * 4 < w || (y1 - y0) * 4 < h {
         return (0, 0, w, h);
@@ -742,14 +751,22 @@ impl Backdrop {
         // Blur relative to the backdrop's size: soft, but shapes and colors still read.
         let radius = (sw / 48).max(1);
         for _ in 0..2 {
-            box_blur(&mut self.small, &mut self.tmp, &mut self.sums, sw, sh, radius);
+            box_blur(
+                &mut self.small,
+                &mut self.tmp,
+                &mut self.sums,
+                sw,
+                sh,
+                radius,
+            );
         }
 
         // Bilinear lookup tables: per output column, the two backdrop columns and weight.
         let taps = |n: usize, m: usize| -> Vec<(usize, usize, u32)> {
             (0..n)
                 .map(|i| {
-                    let f = ((i as f32 + 0.5) * m as f32 / n as f32 - 0.5).clamp(0.0, (m - 1) as f32);
+                    let f =
+                        ((i as f32 + 0.5) * m as f32 / n as f32 - 0.5).clamp(0.0, (m - 1) as f32);
                     let a = f as usize;
                     (a, (a + 1).min(m - 1), ((f - a as f32) * 256.0) as u32)
                 })
@@ -852,7 +869,10 @@ mod tests {
         b.compose(&frame[..3], 1, 1, (0, 0, 1, 1), 9, 9, &mut out);
         // Baked-in bars: only the content rows are copied, the bars get the backdrop.
         b.compose(&frame, fw, fh, (0, 5, fw, 25), fw, fh, &mut out);
-        assert_eq!(&out[5 * fw * 3..25 * fw * 3], &frame[5 * fw * 3..25 * fw * 3]);
+        assert_eq!(
+            &out[5 * fw * 3..25 * fw * 3],
+            &frame[5 * fw * 3..25 * fw * 3]
+        );
     }
 
     #[test]

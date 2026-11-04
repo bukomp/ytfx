@@ -145,7 +145,8 @@ pub fn expand_home(path: &str) -> PathBuf {
 
 /// Keep only youtube.com lines of a Netscape cookie file, and check there is a sign-in.
 fn youtube_cookies(text: &str) -> Result<(String, usize)> {
-    let mut out = String::from("# Netscape HTTP Cookie File\n# youtube.com cookies imported by ytfx\n\n");
+    let mut out =
+        String::from("# Netscape HTTP Cookie File\n# youtube.com cookies imported by ytfx\n\n");
     let (mut count, mut signed_in) = (0, false);
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
@@ -171,7 +172,9 @@ fn youtube_cookies(text: &str) -> Result<(String, usize)> {
         bail!("no youtube.com cookies in that file: export it from a youtube.com tab");
     }
     if !signed_in {
-        bail!("those youtube.com cookies are not signed in: sign in on youtube.com and export again");
+        bail!(
+            "those youtube.com cookies are not signed in: sign in on youtube.com and export again"
+        );
     }
     Ok((out, count))
 }

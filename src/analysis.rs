@@ -143,7 +143,11 @@ impl Analyzer {
         while self.recent.front().is_some_and(|e| e.0 > TROUGH_WINDOW) {
             self.recent.pop_front();
         }
-        let trough = self.recent.iter().map(|e| e.1).fold(f32::INFINITY, f32::min);
+        let trough = self
+            .recent
+            .iter()
+            .map(|e| e.1)
+            .fold(f32::INFINITY, f32::min);
         let rise = if trough.is_finite() {
             energy / trough.max(PEAK_FLOOR * 0.05)
         } else {
@@ -156,10 +160,7 @@ impl Analyzer {
         if self.level < REARM {
             self.armed = true;
         }
-        let beat = self.armed
-            && self.level > HIT
-            && rise > RISE
-            && self.since_beat > MIN_BEAT_GAP;
+        let beat = self.armed && self.level > HIT && rise > RISE && self.since_beat > MIN_BEAT_GAP;
         let strength = if beat {
             (0.5 * (rise - RISE) / 4.0 + 0.5 * (self.level - HIT) / (1.0 - HIT)).clamp(0.0, 1.0)
         } else {
