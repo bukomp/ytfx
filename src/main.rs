@@ -8,6 +8,7 @@ mod player;
 mod preview;
 mod queue;
 mod settings;
+mod textinput;
 mod ui;
 mod youtube;
 
@@ -21,8 +22,8 @@ use anyhow::{Context, Result, bail};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     self as crossterm_terminal, BeginSynchronizedUpdate, EndSynchronizedUpdate,
@@ -40,6 +41,7 @@ use history::History;
 use kitty::Kitty;
 use player::Player;
 use queue::{Queue, RADIO_LOW};
+use textinput::TextInput;
 use youtube::{Entry, Kind, SearchKind, StreamInfo};
 
 type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
@@ -289,7 +291,7 @@ impl ListView {
 pub enum AccountUi {
     Menu,
     /// Typing the path of a cookies.txt.
-    Path(String),
+    Path(TextInput),
     /// Picking a browser from account::BROWSERS.
     Browser(usize),
 }
@@ -324,7 +326,9 @@ pub struct App {
     /// Per tab, the root list and the lists opened from it.
     pub tabs: [Vec<ListView>; 6],
     pub focus: Focus,
-    pub query: String,
+    pub query: TextInput,
+    /// Where the search field's text is on screen, for mouse clicks. Set while drawing.
+    pub search_rect: Option<Rect>,
     pub search_kind: SearchKind,
     pub queue: Queue,
     pub queue_state: ListState,
@@ -432,7 +436,8 @@ impl App {
             tab: Tab::Search,
             tabs: Tab::ALL.map(|t| vec![t.root()]),
             focus: Focus::Search,
-            query: String::new(),
+            query: TextInput::default(),
+            search_rect: None,
             search_kind: SearchKind::Videos,
             queue: Queue::default(),
             queue_state: ListState::default(),
@@ -502,7 +507,7 @@ impl App {
         app.apply_settings(settings::load());
         app.sync_history();
         if let Some(q) = app.cfg.initial.take() {
-            app.query = q;
+            app.query.set(&q);
             app.submit_query();
         } else if app.signed_in.is_some() {
             app.switch_tab(Tab::Home);
@@ -616,7 +621,7 @@ impl App {
     }
 
     fn submit_query(&mut self) {
-        let q = self.query.trim().to_string();
+        let q = self.query.as_str().trim().to_string();
         if q.is_empty() {
             return;
         }
@@ -1019,7 +1024,7 @@ impl App {
         match ui {
             AccountUi::Menu => match k.code {
                 KeyCode::Char('f') => {
-                    *ui = AccountUi::Path(String::new());
+                    *ui = AccountUi::Path(TextInput::default());
                     self.account_msg = None;
                 }
                 KeyCode::Char('b') => {
@@ -1035,12 +1040,9 @@ impl App {
             },
             AccountUi::Path(path) => match k.code {
                 KeyCode::Esc => *ui = AccountUi::Menu,
-                KeyCode::Backspace => {
-                    path.pop();
-                }
-                KeyCode::Char(c) if youtube::is_safe_char(c) => path.push(c),
+                _ if path.handle(k) => {}
                 KeyCode::Enter => {
-                    let path = account::expand_home(path);
+                    let path = account::expand_home(path.as_str());
                     let result = account::import_cookies(&path).map(|n| {
                         let msg = format!(
                             "signed in: kept {n} youtube.com cookies; you can delete the exported file"
@@ -1370,11 +1372,9 @@ impl App {
                 KeyCode::Enter => self.submit_query(),
                 KeyCode::Char('t') if ctrl => self.search_kind = self.search_kind.next(),
                 KeyCode::Esc | KeyCode::Tab | KeyCode::Down => self.focus = Focus::Results,
-                KeyCode::Backspace => {
-                    self.query.pop();
+                _ => {
+                    self.query.handle(k);
                 }
-                KeyCode::Char(c) if !ctrl && youtube::is_safe_char(c) => self.query.push(c),
-                _ => {}
             }
             return;
         }
@@ -1594,11 +1594,42 @@ impl App {
         }
     }
 
+    /// Pasted text (bracketed paste) goes into the text field on screen; in the
+    /// browser it goes to the search, so a pasted YouTube link is one enter away.
+    fn on_paste(&mut self, text: &str) {
+        if self.show_help {
+            return;
+        }
+        match &mut self.account_ui {
+            Some(AccountUi::Path(path)) => path.insert(text),
+            Some(_) => {}
+            None if self.show_video => {}
+            None => {
+                self.tab = Tab::Search;
+                self.focus = Focus::Search;
+                self.query.insert(text);
+            }
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
         if self.show_help {
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.show_help = false;
+            }
+            return;
+        }
+        if !self.show_video
+            && self.account_ui.is_none()
+            && m.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(r) = self.search_rect
+        {
+            if r.contains(pos) {
+                self.focus = Focus::Search;
+                self.query.click(usize::from(pos.x - r.x));
+            } else if matches!(self.focus, Focus::Search) {
+                self.focus = Focus::Results;
             }
             return;
         }
@@ -1821,6 +1852,7 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
                 Event::Mouse(m) => app.on_mouse(m),
+                Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             }
             if app.quit {
@@ -1864,7 +1896,13 @@ fn setup_terminal() -> Result<Term> {
     }));
     enable_raw_mode()?;
     let mut out = BufWriter::with_capacity(1 << 20, stdout());
-    execute!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        cursor::Hide
+    )?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
@@ -1873,6 +1911,7 @@ fn restore_terminal() {
     let _ = execute!(
         stdout(),
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         cursor::Show
     );

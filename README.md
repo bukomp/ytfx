@@ -68,6 +68,21 @@ Browser:
 
 In the search box, `esc` (or `tab` / `down`) moves to the results. Pasting a URL that starts with `http://` or `https://` plays it directly. Pasting a playlist or channel URL opens it as a list.
 
+The search box (and the cookies.txt path field) edits like a normal text field:
+
+| Key | Action |
+| --- | --- |
+| `left` / `right` (or `ctrl-b` / `ctrl-f`) | Move one character |
+| `option`/`alt`/`ctrl` + `left` / `right` (or `alt-b` / `alt-f`) | Move one word |
+| `home` / `end`, `ctrl-a` / `ctrl-e`, `cmd-left` / `cmd-right` | Go to the start / end |
+| `backspace` / `delete` (or `ctrl-h` / `ctrl-d`) | Delete one character back / forward |
+| `option`/`alt`/`ctrl` + `backspace`, `ctrl-w` | Delete the word before the cursor |
+| `option`/`alt`/`ctrl` + `delete`, `alt-d` | Delete the word after the cursor |
+| `ctrl-u` / `cmd-backspace`, `ctrl-k` | Delete to the start / to the end |
+| mouse click | Put the cursor there |
+
+Pasted text goes into the search box as one piece, even when the box isn't focused, so a pasted link doesn't trigger key commands.
+
 Player:
 
 | Key | Action |
@@ -203,6 +218,7 @@ Video frames are scheduled against the audio clock (samples actually played), so
 ## Architecture
 
 - `src/main.rs`: argument parsing, app state, main loop, key handling
+- `src/textinput.rs`: one-line text field (cursor, word jumps, editing keys, scrolling)
 - `src/youtube.rs`: `yt-dlp` search and stream URL resolution
 - `src/account.rs`: sign-in (cookie import, saved account)
 - `src/queue.rs`: play queue and radio

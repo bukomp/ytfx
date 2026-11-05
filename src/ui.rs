@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Widget};
@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Widg
 use crate::account::BROWSERS;
 use crate::effects::{Fx, PRESETS};
 use crate::preview::{self, Slot};
+use crate::textinput::TextInput;
 use crate::youtube::{Entry, Kind};
 use crate::{AccountUi, App, Focus, RES_STEPS, Renderer, Tab};
 use ratatui::layout::Position;
@@ -180,12 +181,12 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     );
 
     let search_focused = matches!(app.focus, Focus::Search);
+    app.search_rect = None;
     if search_tab {
+        let field = search.inner(Margin::new(1, 1));
+        app.search_rect = Some(field);
         let line = if search_focused {
-            Line::from(vec![
-                Span::raw(app.query.as_str()),
-                Span::styled("▏", Style::new().fg(ACCENT)),
-            ])
+            input_line(&app.query, field.width.into())
         } else if app.query.is_empty() {
             Line::from(Span::styled(
                 "press / to search, or paste a YouTube URL",
@@ -1053,11 +1054,14 @@ fn draw_account(f: &mut Frame, app: &App) {
         Some(AccountUi::Path(ref path)) => {
             lines.extend([
                 note("Path of the exported cookies.txt (~ works):"),
-                Line::from(vec![
-                    Span::styled("> ", Style::new().fg(ACCENT)),
-                    Span::raw(path.as_str()),
-                    Span::styled("▏", Style::new().fg(ACCENT)),
-                ]),
+                {
+                    // Inside the popup's border, after the "> ".
+                    let cols = f.area().width.min(66).saturating_sub(4);
+                    let mut line = input_line(path, cols.into());
+                    line.spans
+                        .insert(0, Span::styled("> ", Style::new().fg(ACCENT)));
+                    line
+                },
                 Line::raw(""),
                 note("enter import   esc back"),
             ]);
@@ -1104,6 +1108,17 @@ fn draw_account(f: &mut Frame, app: &App) {
             ),
         rect,
     );
+}
+
+/// A focused text field: the part around the cursor that fits in `cols`, with a
+/// block cursor.
+fn input_line(input: &TextInput, cols: usize) -> Line<'_> {
+    let (before, at, after) = input.view(cols);
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(at.unwrap_or(" "), Style::new().fg(Color::Black).bg(ACCENT)),
+        Span::raw(after),
+    ])
 }
 
 fn hints(pairs: &[(&str, &str)]) -> Line<'static> {
