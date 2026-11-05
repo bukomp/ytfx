@@ -2,6 +2,7 @@ mod account;
 mod analysis;
 mod audio;
 mod effects;
+mod history;
 mod kitty;
 mod player;
 mod preview;
@@ -19,19 +20,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::terminal::{
     self as crossterm_terminal, BeginSynchronizedUpdate, EndSynchronizedUpdate,
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::crossterm::{cursor, execute, queue};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
 use account::Account;
 use analysis::Analyzer;
 use audio::AudioOut;
 use effects::{Backdrop, Drive, Effects, Fx, PRESETS, Rng};
+use history::History;
 use kitty::Kitty;
 use player::Player;
 use queue::{Queue, RADIO_LOW};
@@ -204,10 +209,18 @@ pub enum Tab {
     Subs,
     Library,
     Queue,
+    History,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Search, Tab::Home, Tab::Subs, Tab::Library, Tab::Queue];
+    pub const ALL: [Tab; 6] = [
+        Tab::Search,
+        Tab::Home,
+        Tab::Subs,
+        Tab::Library,
+        Tab::Queue,
+        Tab::History,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -216,6 +229,7 @@ impl Tab {
             Tab::Subs => "subscriptions",
             Tab::Library => "library",
             Tab::Queue => "queue",
+            Tab::History => "history",
         }
     }
 
@@ -226,6 +240,7 @@ impl Tab {
             Tab::Subs => ListView::new("subscriptions", Some(youtube::SUBSCRIPTIONS.into())),
             Tab::Library => ListView::fixed("library", youtube::library()),
             Tab::Queue => ListView::fixed("queue", Vec::new()),
+            Tab::History => ListView::fixed("history", Vec::new()),
         }
     }
 }
@@ -307,12 +322,14 @@ pub struct App {
     cfg: Config,
     pub tab: Tab,
     /// Per tab, the root list and the lists opened from it.
-    pub tabs: [Vec<ListView>; 5],
+    pub tabs: [Vec<ListView>; 6],
     pub focus: Focus,
     pub query: String,
     pub search_kind: SearchKind,
     pub queue: Queue,
     pub queue_state: ListState,
+    /// Videos played here, newest first; shown in the history tab.
+    history: History,
     /// (message, is_error)
     pub status: Option<(String, bool)>,
     /// Work the user is waiting for, shown as a spinner overlay.
@@ -346,10 +363,23 @@ pub struct App {
     pub preset: usize,
     pub show_hud: bool,
     pub show_help: bool,
+    /// The effects side menu is open, its selected effect (index into `Fx::ALL`) and
+    /// first visible row.
+    pub fx_menu: bool,
+    pub fx_cursor: usize,
+    pub fx_scroll: usize,
+    /// Set by ui::draw for mouse clicks: the FX button, the menu's inside, and which
+    /// effect each menu row shows (screen row, index into `Fx::ALL`).
+    pub fx_button: Option<Rect>,
+    pub fx_menu_rect: Option<Rect>,
+    pub fx_rows: Vec<(u16, usize)>,
     /// What's shown: the effects output, on a backdrop canvas when `fill` is on.
     pub frame_out: Vec<u8>,
     pub frame_dims: (usize, usize),
     fx_out: Vec<u8>,
+    /// While paused: what the shown frame was made from. Effects only run again when
+    /// this changes (a seek, another effect set, a resize), not on every tick.
+    paused_key: Option<u64>,
     backdrop: Backdrop,
     /// Fill space around the video with a blurred, darkened copy of it.
     pub fill: bool,
@@ -406,6 +436,7 @@ impl App {
             search_kind: SearchKind::Videos,
             queue: Queue::default(),
             queue_state: ListState::default(),
+            history: History::load(),
             status: None,
             busy: None,
             account_ui: None,
@@ -432,9 +463,16 @@ impl App {
             preset: 0,
             show_hud: true,
             show_help: false,
+            fx_menu: false,
+            fx_cursor: 0,
+            fx_scroll: 0,
+            fx_button: None,
+            fx_menu_rect: None,
+            fx_rows: Vec::new(),
             frame_out: Vec::new(),
             frame_dims: (0, 0),
             fx_out: Vec::new(),
+            paused_key: None,
             backdrop: Backdrop::default(),
             fill: true,
             crop: None,
@@ -462,6 +500,7 @@ impl App {
             cfg,
         };
         app.apply_settings(settings::load());
+        app.sync_history();
         if let Some(q) = app.cfg.initial.take() {
             app.query = q;
             app.submit_query();
@@ -712,6 +751,7 @@ impl App {
         let size = self.decode_size(self.area, info.aspect);
         match Player::new(info, &self.audio, size, self.cfg.fps) {
             Ok(p) => {
+                self.remember_played(&p);
                 self.player = Some(p);
                 self.crop = None;
                 self.crop_vote.1 = 0;
@@ -720,6 +760,43 @@ impl App {
             }
             Err(e) => self.track_failed(format!("{e:#}")),
         }
+    }
+
+    /// Add the video that just started to the history (YouTube videos only: other sites
+    /// have no queue entry to replay from).
+    fn remember_played(&mut self, p: &Player) {
+        let Some(mut entry) = self.queue.current().cloned() else {
+            return;
+        };
+        // Pasted links use the URL as a stand-in title until the real one is known.
+        if entry.title.starts_with("http") && !p.title.is_empty() {
+            entry.title = p.title.clone();
+        }
+        entry.duration = entry.duration.or(p.duration);
+        self.history.record(&entry);
+        if let Err(e) = self.history.save() {
+            self.status = Some((format!("couldn't save history: {e:#}"), true));
+        }
+        self.sync_history();
+    }
+
+    /// Refresh the history tab's list, keeping the selection on the same video.
+    fn sync_history(&mut self) {
+        let view = &mut self.tabs[Tab::History as usize][0];
+        let selected = view.selected().map(|(_, e)| e.target.clone());
+        view.entries = self.history.entries();
+        let i = selected
+            .and_then(|id| view.entries.iter().position(|e| e.target == id))
+            .or_else(|| view.state.selected())
+            .map(|i| i.min(view.entries.len().saturating_sub(1)))
+            .unwrap_or(0);
+        view.state.select((!view.entries.is_empty()).then_some(i));
+        view.note = view.entries.is_empty().then(|| {
+            (
+                "nothing played yet: videos you watch show up here".into(),
+                false,
+            )
+        });
     }
 
     /// The current video couldn't play: skip it, unless too many failed in a row.
@@ -1074,6 +1151,21 @@ impl App {
             return;
         }
         if let Some(f) = self.player.as_ref().and_then(|p| p.current.as_ref()) {
+            let key = paused.then(|| {
+                use std::hash::{DefaultHasher, Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                (f.pts.to_bits(), f.w, f.h, self.effects.enabled()).hash(&mut h);
+                (self.effects.intensity.to_bits(), self.fill, self.crop, area).hash(&mut h);
+                (self.renderer == Renderer::Kitty, self.fx_menu).hash(&mut h);
+                self.cell_aspect.to_bits().hash(&mut h);
+                // Keep rendering until the last hit has faded out, then hold still.
+                ((self.drive.pulse * 20.0) as u32).hash(&mut h);
+                h.finish()
+            });
+            if key.is_some() && key == self.paused_key && !self.frame_out.is_empty() {
+                return;
+            }
+            self.paused_key = key;
             // Look for baked-in black bars on the clean frame (effects add grain to them).
             if self.fill && self.ticks.is_multiple_of(CROP_EVERY) {
                 let found = effects::content_rect(&f.data, f.w, f.h);
@@ -1124,7 +1216,7 @@ impl App {
         fh: usize,
         crop: effects::Crop,
     ) -> Option<(usize, usize)> {
-        let video = ui::video_area(area);
+        let video = ui::video_area(area, self.fx_menu);
         if !self.fill || video.width == 0 || video.height == 0 {
             return None;
         }
@@ -1190,7 +1282,11 @@ impl App {
     /// Pixel size the video decoder should produce for the current renderer.
     fn decode_size(&self, area: Rect, aspect: f64) -> (usize, usize) {
         match self.renderer {
-            Renderer::Blocks => ui::fit(ui::video_area(area), aspect, self.cfg.max_width),
+            Renderer::Blocks => ui::fit(
+                ui::video_area(area, self.fx_menu),
+                aspect,
+                self.cfg.max_width,
+            ),
             Renderer::Kitty => {
                 let h = RES_STEPS[self.res];
                 (((h as f64 * aspect) as usize).max(2) & !1, h)
@@ -1317,7 +1413,7 @@ impl App {
                 self.tab = Tab::Search;
                 self.focus = Focus::Search;
             }
-            KeyCode::Char(c @ '1'..='5') => self.switch_tab(Tab::ALL[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='6') => self.switch_tab(Tab::ALL[c as usize - '1' as usize]),
             KeyCode::Tab => self.switch_tab(Tab::ALL[(self.tab as usize + 1) % Tab::ALL.len()]),
             KeyCode::BackTab => {
                 self.switch_tab(Tab::ALL[(self.tab as usize + Tab::ALL.len() - 1) % Tab::ALL.len()])
@@ -1342,8 +1438,18 @@ impl App {
                     self.status = Some(("can't remove the playing video".into(), false));
                 }
             }
+            KeyCode::Char('x') | KeyCode::Delete if self.tab == Tab::History && depth == 1 => {
+                if let Some((_, e)) = self.view().selected() {
+                    let id = e.target.clone();
+                    self.history.remove(&id);
+                    if let Err(e) = self.history.save() {
+                        self.status = Some((format!("couldn't save history: {e:#}"), true));
+                    }
+                    self.sync_history();
+                }
+            }
             KeyCode::Char('u') => {
-                if self.tab == Tab::Library && depth == 1 {
+                if matches!(self.tab, Tab::Library | Tab::History) && depth == 1 {
                     return;
                 }
                 self.view_mut().loaded = false;
@@ -1389,13 +1495,15 @@ impl App {
             }
             return;
         }
-        let single = self.tab == Tab::Search && self.tabs[Tab::Search as usize].len() == 1;
+        // Search results and history play one at a time.
+        let single = matches!(self.tab, Tab::Search | Tab::History)
+            && self.tabs[self.tab as usize].len() == 1;
         let Some((i, entry)) = self.view().selected() else {
             return;
         };
         let entry = entry.clone();
         match entry.kind {
-            // Search results play one at a time; feeds and playlists play through.
+            // Feeds and playlists play through.
             Kind::Video if single => self.play_entries(&[entry], 0),
             Kind::Video => {
                 let entries = self.view().entries.clone();
@@ -1457,8 +1565,74 @@ impl App {
         }
     }
 
-    fn player_key(&mut self, k: KeyEvent) {
+    /// Keys for the open effects menu. Returns false for keys it leaves to the player.
+    fn fx_menu_key(&mut self, k: KeyEvent) -> bool {
+        let n = Fx::ALL.len();
         match k.code {
+            KeyCode::Up | KeyCode::Char('k') => self.fx_cursor = (self.fx_cursor + n - 1) % n,
+            KeyCode::Down | KeyCode::Char('j') => self.fx_cursor = (self.fx_cursor + 1) % n,
+            KeyCode::PageUp => self.fx_cursor = self.fx_cursor.saturating_sub(8),
+            KeyCode::PageDown => self.fx_cursor = (self.fx_cursor + 8).min(n - 1),
+            KeyCode::Home => self.fx_cursor = 0,
+            KeyCode::End => self.fx_cursor = n - 1,
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_fx(self.fx_cursor),
+            KeyCode::Char('c') => {
+                self.effects.set_enabled(&[]);
+                self.save_settings();
+            }
+            KeyCode::Esc | KeyCode::Char('e') => self.fx_menu = false,
+            _ => return false,
+        }
+        true
+    }
+
+    fn toggle_fx(&mut self, i: usize) {
+        if let Some(&fx) = Fx::ALL.get(i) {
+            self.fx_cursor = i;
+            self.effects.toggle(fx);
+            self.save_settings();
+        }
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        if self.show_help {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.show_help = false;
+            }
+            return;
+        }
+        if !self.show_video || self.account_ui.is_some() {
+            return;
+        }
+        let in_menu = self.fx_menu_rect.is_some_and(|r| r.contains(pos));
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.fx_button.is_some_and(|r| r.contains(pos)) {
+                    self.fx_menu = !self.fx_menu;
+                } else if let Some(i) = ui::fx_row_at(self, pos) {
+                    self.toggle_fx(i);
+                }
+            }
+            MouseEventKind::ScrollUp if in_menu => {
+                self.fx_cursor = self.fx_cursor.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown if in_menu => {
+                self.fx_cursor = (self.fx_cursor + 1).min(Fx::ALL.len() - 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn player_key(&mut self, k: KeyEvent) {
+        if self.fx_menu && self.fx_menu_key(k) {
+            return;
+        }
+        match k.code {
+            KeyCode::Char('e') => {
+                self.fx_menu = true;
+                return;
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                 return self.stop_playback(None);
             }
@@ -1504,20 +1678,13 @@ impl App {
             }
             KeyCode::Char('[') => self.effects.intensity = (self.effects.intensity - 0.1).max(0.1),
             KeyCode::Char(']') => self.effects.intensity = (self.effects.intensity + 0.1).min(2.0),
-            KeyCode::Char(c) if Fx::from_key(c).is_some() => {
-                if let Some(fx) = Fx::from_key(c) {
-                    self.effects.toggle(fx);
-                }
-            }
             KeyCode::Char('h') => return self.show_hud = !self.show_hud,
             KeyCode::Char('r') => return self.step_res(true),
             KeyCode::Char('R') => return self.step_res(false),
             KeyCode::Char('g') => return self.toggle_renderer(),
             _ => {}
         }
-        if matches!(k.code, KeyCode::Char('s' | 'f' | 'p' | 'P' | '[' | ']'))
-            || matches!(k.code, KeyCode::Char(c) if Fx::from_key(c).is_some())
-        {
+        if matches!(k.code, KeyCode::Char('s' | 'f' | 'p' | 'P' | '[' | ']')) {
             return self.save_settings();
         }
 
@@ -1557,6 +1724,7 @@ impl App {
         (
             self.busy.is_some(),
             self.show_help,
+            self.fx_menu,
             self.account_ui.is_some(),
             &self.status,
             self.player.as_ref().map(|p| &p.title),
@@ -1650,10 +1818,10 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
             if !event::poll(timeout)? {
                 break;
             }
-            if let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-            {
-                app.on_key(k);
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+                Event::Mouse(m) => app.on_mouse(m),
+                _ => {}
             }
             if app.quit {
                 break;
@@ -1696,13 +1864,18 @@ fn setup_terminal() -> Result<Term> {
     }));
     enable_raw_mode()?;
     let mut out = BufWriter::with_capacity(1 << 20, stdout());
-    execute!(out, EnterAlternateScreen, cursor::Hide)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        cursor::Show
+    );
 }
 
 fn main() -> Result<()> {

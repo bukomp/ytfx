@@ -1,6 +1,6 @@
 # ytfx
 
-A terminal YouTube browser. It searches with `yt-dlp` (no API key), plays the video in the terminal with audio (as real pixels in kitty, Ghostty and WezTerm, or as truecolor half-block characters elsewhere), and layers "edit"-style effects on top: zoom punch, shake, RGB split, blur, red grade, glitch, trails, invert flash, VHS, pixelate, mirror and strobe. With SYNC on, the effects are driven by the bass of the music. Press `s` to turn SYNC off; the effects then stay at a steady level with random hits.
+A terminal YouTube browser. It searches with `yt-dlp` (no API key), plays the video in the terminal with audio (as real pixels in kitty, Ghostty and WezTerm, or as truecolor half-block characters elsewhere), and layers 37 "edit"-style effects on top (zoom punches, shake, glitches, colour grades, VHS, CRT, film and more), picked from a side menu. With SYNC on, the effects are driven by the bass of the music. Press `s` to turn SYNC off; the effects then stay at a steady level with random hits.
 
 ## Requirements
 
@@ -46,7 +46,7 @@ Browser:
 | `enter` | Search (in the box) / play video / open playlist or channel |
 | `ctrl-t` | In the search box: cycle videos / playlists / channels |
 | `t` | In results on the search tab: cycle videos / playlists / channels |
-| `1` `2` `3` `4` `5` | Search, home, subscriptions, library, queue tab |
+| `1` `2` `3` `4` `5` `6` | Search, home, subscriptions, library, queue, history tab |
 | `tab` / `shift-tab` | Next / previous tab (in the search box, `tab` moves to the results) |
 | `j` `k` / `down` `up` | Move selection |
 | `PgUp` `PgDn` | Move selection by 10 |
@@ -56,7 +56,7 @@ Browser:
 | `R` | Start radio from a random video in this list |
 | `S` | Shuffle-play this list |
 | `a` | Add the selected video to the queue |
-| `x` | Remove the selected item (queue tab) |
+| `x` | Remove the selected item (queue and history tabs) |
 | `u` | Reload this list |
 | `p` | Show or hide the preview pane (thumbnail and details of the selected row; needs a list at least 90 columns wide) |
 | `L` | YouTube account (sign in / out) |
@@ -82,7 +82,7 @@ Player:
 | `s` | Toggle bass sync |
 | `p` / `P` | Next / previous preset |
 | `[` `]` | Effect intensity down / up (0.1 to 2.0) |
-| `1-9` `0` `-` `=` | Toggle individual effects (map below) |
+| `e` | Open / close the effects menu (also the `◂ FX n` button in the HUD) |
 | `r` / `R` | Resolution up / down (graphics renderer) |
 | `g` | Switch between pixel graphics and text blocks |
 | `f` | Blurred background around narrow videos on / off |
@@ -91,14 +91,28 @@ Player:
 | `q` / `esc` / `backspace` | Stop playback and go back |
 | `ctrl-c` | Quit |
 
-Effect keys:
+Effects menu:
 
-| Key | Effect | Key | Effect | Key | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `1` | zoom | `5` | red | `9` | vhs |
-| `2` | shake | `6` | glitch | `0` | pixel |
-| `3` | rgb | `7` | trails | `-` | mirror |
-| `4` | blur | `8` | invert | `=` | strobe |
+`e`, or a click on the `◂ FX n` button at the right end of the HUD's bottom line (`n` is the number of enabled effects), opens a side menu on the right edge of the player. The video shrinks to make room. Effects are listed under group headers, and the description of the selected effect shows at the bottom.
+
+| Key | Action |
+| --- | --- |
+| `up` `down` / `j` `k` | Move |
+| `PgUp` `PgDn` `Home` `End` | Jump |
+| `space` / `enter` | Toggle the selected effect |
+| `c` | Clear all effects |
+| `esc` / `e` | Close the menu |
+
+Mouse: click an effect to toggle it, use the wheel to scroll. While the menu is open, `up` `down` and `space` go to the menu, not to volume and pause. `p` / `P` and `[` `]` still work.
+
+| Group | Effects |
+| --- | --- |
+| Motion | zoom (punch in on hits), shake, bounce, spin (alternating kick), wave (rows sway), bulge (fisheye pop), mirror (left half to right), kaleido (four-way mirror) |
+| Time | trails (motion smear), echo (colour channels lag), tunnel (zooming feedback), stutter (freeze on big hits) |
+| Glitch | rgb (chromatic aberration), glitch (datamosh), slice (bands slide apart), static (tv snow), swap (colour channels swap) |
+| Color | red (blood-red duotone), noir (black and white), thermal (heat camera), vapor (purple / cyan), hue (drifts, jumps on hits), poster (flat bands), solar (solarized highlights), invert (negative flash) |
+| Light | strobe (brightness pumps), flash (white flash), glow (bloom), vignette (dark edges pump), cinema (black bars slam in) |
+| Texture | blur (soft focus), pixel (chunky pixels), dither (ordered dither), edges (neon outlines), crt (scanlines, phosphor mask), film (sepia, grain, scratches), vhs (tape wobble, tracking, grain) |
 
 ytfx remembers the enabled effects, preset, intensity, bass sync and background fill across runs, in `~/.config/ytfx/settings.json`. `--no-sync` still turns sync off for one run.
 
@@ -110,19 +124,26 @@ Presets (`p` / `P`; applying one replaces the current effect set):
 | phonk red | zoom, shake, red, invert, strobe, blur |
 | glitchcore | rgb, glitch, pixel, trails, vhs, shake |
 | dream | blur, trails, zoom, mirror |
+| vaporwave | vapor, echo, wave, glow, crt |
+| noir | noir, film, vignette, cinema, stutter |
+| rave | kaleido, tunnel, hue, flash, spin, zoom |
+| heat | thermal, bulge, rgb, static, shake |
+| broken tv | crt, slice, swap, static, bounce |
+| neon | edges, glow, hue, trails, zoom |
 | clean | none |
 
 ## Tabs
 
-The browser has five tabs. Press `1` to `5`, or `tab` / `shift-tab`, to switch.
+The browser has six tabs. Press `1` to `6`, or `tab` / `shift-tab`, to switch.
 
 1. Search: search results.
 2. Home: your recommendations.
 3. Subscriptions: the latest videos from channels you subscribe to.
 4. Library: Watch later, Liked videos, History, Your playlists and Subscribed channels.
 5. Queue: the play queue.
+6. History: the videos you played in ytfx, newest first. A video you play again moves to the top.
 
-Home, subscriptions and library need sign-in.
+Home, subscriptions and library need sign-in. History does not: ytfx keeps it on your computer, in `~/.config/ytfx/history.json` (last 500 videos). Enter plays one video from it. `x` removes the selected video from it. To clear it, delete the file. YouTube's own watch history is in Library.
 
 ## Sign-in
 
@@ -144,7 +165,7 @@ YouTube can rate-limit or flag accounts that tools like yt-dlp use. A secondary 
 
 Search finds videos, playlists or channels. Cycle the kind with `ctrl-t` in the search box, or `t` in the results. Enter on a playlist or channel opens it as a list. `esc`, `backspace`, `h` or `left` goes back.
 
-Enter on a video in a feed, playlist or channel plays through that list. A video from plain search results plays alone. `a` adds the selected video to the queue, `S` shuffle-plays the current list, and `x` removes an item on the queue tab.
+Enter on a video in a feed, playlist or channel plays through that list. A video from plain search results or history plays alone. `a` adds the selected video to the queue, `S` shuffle-plays the current list, and `x` removes an item on the queue tab.
 
 When a video ends, the next one starts. ytfx resolves the next video in the background a few seconds into the current one, so it starts without waiting. If 3 videos in a row fail, the queue stops.
 
@@ -161,7 +182,7 @@ There are two renderers:
 - **Graphics (kitty protocol):** used automatically in kitty, Ghostty and WezTerm. The video is sent as a real image at the resolution you choose (`--res`, or `r` / `R` while playing), and the terminal scales it to fit the window. kitty receives frames through shared memory, so even 720p costs almost nothing to send. Other terminals receive them inline as base64.
 - **Blocks:** used everywhere else, and inside tmux. Each cell shows two pixels with the `▀` character, so the resolution is the terminal grid. For example, 200 columns gives a 200x112 picture. To get more detail, make the font smaller.
 
-The source stream is fetched at 720p or at the chosen resolution, whichever is higher. With every effect on, processing takes about 7.5 ms per frame at 720p and about 17 ms at 1080p. With no effects on, it costs almost nothing.
+The source stream is fetched at 720p or at the chosen resolution, whichever is higher. At 720p, each preset takes about 0.7 to 3.2 ms per frame, and no single effect takes more than about 1.5 ms. With all 37 effects on at once, it takes about 3.7 ms at 360p, 14 ms at 720p and 32 ms at 1080p. Blur and glow run at reduced resolution, per-channel curves (poster, solar, strobe, flash, invert) are combined into one pass, and history buffers exist only while their effect is on. While paused, the effects stop running once the last hit has faded, until something changes (a seek, another effect, a resize). With no effects on, it costs almost nothing.
 
 When the video doesn't fill its area (another aspect ratio, or smaller than the window), ytfx fills the empty space with a zoomed, blurred and darkened copy of the video. `f` turns this off.
 
@@ -188,9 +209,9 @@ Video frames are scheduled against the audio clock (samples actually played), so
 - `src/player.rs`: ffmpeg video and audio decoders, A/V sync, seek, resize
 - `src/audio.rs`: cpal output, volume, and the tap of played samples
 - `src/analysis.rs`: FFT, bass level, beat detection
-- `src/effects.rs`: effect pipeline, presets, effect key map
+- `src/effects.rs`: effect pipeline, presets, effect catalogue (groups, descriptions)
 - `src/kitty.rs`: kitty graphics protocol output (shared memory or inline base64)
-- `src/ui.rs`: ratatui rendering (browser, HUD, help, account dialog) and the half-block video widget
+- `src/ui.rs`: ratatui rendering (browser, HUD, effects menu, help, account dialog) and the half-block video widget
 
 ## Troubleshooting
 
@@ -210,9 +231,11 @@ Video frames are scheduled against the audio clock (samples actually played), so
 cargo test --release
 ```
 
-Two tests are ignored by default because they need input files:
+Three tests are ignored by default because they need input files:
 
 - `real_audio` (`src/analysis.rs`): runs the analyzer on real audio.
   `YTFX_PCM=file.f32 cargo test real_audio -- --ignored --nocapture`, where the file is 48 kHz stereo f32le (for example from `ffmpeg ... -ac 2 -ar 48000 -f f32le`).
 - `preview` (`src/effects.rs`): writes one PPM per preset, mid-beat.
   `YTFX_FRAME=frame.rgb YTFX_OUT=dir cargo test preview -- --ignored`, where `frame.rgb` is a raw 200x112 RGB24 frame and `dir` is the output directory.
+- `preview_each` (`src/effects.rs`): writes one PPM per effect, on a hit.
+  `YTFX_FRAME=frame.rgb YTFX_OUT=dir cargo test preview_each -- --ignored`, with the same inputs as `preview`. Set `YTFX_SIZE=1280x720` for a frame of another size.

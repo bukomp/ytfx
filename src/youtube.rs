@@ -701,7 +701,7 @@ fn last_line(stderr: &[u8]) -> String {
 
 /// Strip control and bidi/zero-width characters from remote text before it reaches the
 /// terminal; ratatui passes ESC through as-is, so a title could otherwise inject escape sequences.
-fn clean(s: &str) -> String {
+pub fn clean(s: &str) -> String {
     s.chars().filter(|&c| is_safe_char(c)).collect()
 }
 

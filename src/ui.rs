@@ -10,6 +10,7 @@ use crate::effects::{Fx, PRESETS};
 use crate::preview::{self, Slot};
 use crate::youtube::{Entry, Kind};
 use crate::{AccountUi, App, Focus, RES_STEPS, Renderer, Tab};
+use ratatui::layout::Position;
 
 pub const HUD_HEIGHT: u16 = 2;
 const ACCENT: Color = Color::Rgb(255, 40, 60);
@@ -20,12 +21,38 @@ const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '
 /// Narrower lists than this get no preview pane.
 const PREVIEW_MIN_WIDTH: u16 = 90;
 
-/// The part of the screen the video may use (everything above the HUD).
-pub fn video_area(area: Rect) -> Rect {
+/// Width of the effects side menu.
+const FX_MENU_WIDTH: u16 = 30;
+
+/// The part of the screen the video may use: everything above the HUD, left of the
+/// effects menu when it is open.
+pub fn video_area(area: Rect, fx_menu: bool) -> Rect {
+    let menu = if fx_menu { fx_menu_area(area).width } else { 0 };
     Rect {
+        height: area.height.saturating_sub(HUD_HEIGHT),
+        width: area.width - menu,
+        ..area
+    }
+}
+
+/// Where the effects menu goes: the right edge, above the HUD.
+fn fx_menu_area(area: Rect) -> Rect {
+    let width = FX_MENU_WIDTH.min(area.width / 2);
+    Rect {
+        x: area.right() - width,
+        width,
         height: area.height.saturating_sub(HUD_HEIGHT),
         ..area
     }
+}
+
+/// Which effect (index into `Fx::ALL`) a click at `pos` lands on in the menu.
+pub fn fx_row_at(app: &App, pos: Position) -> Option<usize> {
+    let rect = app.fx_menu_rect?;
+    if !rect.contains(pos) {
+        return None;
+    }
+    app.fx_rows.iter().find(|r| r.0 == pos.y).map(|r| r.1)
 }
 
 /// The largest cell rectangle with the picture's aspect ratio, centered in `area`.
@@ -58,6 +85,10 @@ pub fn fit(area: Rect, aspect: f64, max_width: u16) -> (usize, usize) {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // Click targets are set again by whatever gets drawn this frame.
+    app.fx_button = None;
+    app.fx_menu_rect = None;
+    app.fx_rows.clear();
     // Until the first frame arrives the browser stays up, with the spinner over it.
     let loading = app
         .player
@@ -134,13 +165,15 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
         };
         spans.push(Span::styled(label, style));
     }
-    let [tabs_area, account_area] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(30)]).areas(header);
-    f.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
     let account = match &app.signed_in {
         Some(how) => Span::styled(format!("● {how} "), Style::new().fg(CHANNEL)),
         None => Span::styled("L sign in ", Style::new().fg(DIM)),
     };
+    // Only as wide as its text, so the tabs keep the room on narrower terminals.
+    let account_width = (account.width() as u16).min(30);
+    let [tabs_area, account_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(account_width)]).areas(header);
+    f.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
     f.render_widget(
         Paragraph::new(Line::from(account)).alignment(Alignment::Right),
         account_area,
@@ -204,7 +237,16 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             ("x", "remove"),
             ("R", "radio"),
             ("S", "shuffle"),
-            ("1-5", "tabs"),
+            ("1-6", "tabs"),
+            ("?", "help"),
+        ]),
+        None if app.tab == Tab::History => hints(&[
+            ("enter", "play"),
+            ("x", "forget"),
+            ("r", "radio"),
+            ("a", "queue"),
+            ("S", "shuffle all"),
+            ("1-6", "tabs"),
             ("?", "help"),
         ]),
         None => hints(&[
@@ -212,7 +254,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             ("r", "radio"),
             ("a", "queue"),
             ("S", "shuffle all"),
-            ("1-5", "tabs"),
+            ("1-6", "tabs"),
             ("L", "account"),
             ("?", "help"),
         ]),
@@ -380,6 +422,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
 
     let hint = match (app.tab, e.kind) {
         (Tab::Queue, _) => "enter play   x remove",
+        (Tab::History, Kind::Video) => "enter play   r radio   a queue   x forget",
         (_, Kind::Video) => "enter play   r radio   a queue",
         (_, Kind::Playlist) => "enter open",
         (_, Kind::Channel) => "enter open uploads",
@@ -555,7 +598,7 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
 
-    let video = video_area(area);
+    let video = video_area(area, app.fx_menu);
     let (fw, fh) = app.frame_dims;
     let have_frame = fw > 0 && app.frame_out.len() >= fw * fh * 3;
     if have_frame && app.renderer == Renderer::Kitty {
@@ -599,6 +642,10 @@ fn draw_player(f: &mut Frame, app: &mut App) {
         );
     }
 
+    if app.fx_menu {
+        draw_fx_menu(f, app, fx_menu_area(area));
+    }
+
     if app.show_hud && area.height > HUD_HEIGHT {
         let hud = Rect {
             y: area.bottom() - HUD_HEIGHT,
@@ -609,7 +656,161 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_hud(f: &mut Frame, app: &App, area: Rect) {
+fn draw_fx_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    if area.width < 8 || area.height < 6 {
+        return;
+    }
+    const BG: Color = Color::Rgb(14, 6, 9);
+    f.render_widget(Clear, area);
+    let block = rounded()
+        .title(Span::styled(
+            " effects ",
+            Style::new().fg(Color::White).bold(),
+        ))
+        .title(
+            Line::styled(
+                format!(" {}/{} ", app.effects.count(), Fx::ALL.len()),
+                Style::new().fg(ACCENT),
+            )
+            .right_aligned(),
+        )
+        .border_style(Style::new().fg(ACCENT))
+        .style(Style::new().bg(BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.fx_menu_rect = Some(inner);
+
+    let [head, list, foot] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {}", PRESETS[app.preset].name),
+                    Style::new().fg(Color::White).bold(),
+                ),
+                Span::styled(
+                    format!("  ×{:.1}", app.effects.intensity),
+                    Style::new().fg(DIM),
+                ),
+            ]),
+            Line::styled(" p/P preset  [ ] amount", Style::new().fg(DIM)),
+        ]),
+        head,
+    );
+
+    // Rows: a header before each group, then its effects. Index into Fx::ALL, or None.
+    let mut rows: Vec<Option<usize>> = Vec::with_capacity(Fx::ALL.len() + 8);
+    for (i, fx) in Fx::ALL.into_iter().enumerate() {
+        if i == 0 || Fx::ALL[i - 1].group() != fx.group() {
+            rows.push(None);
+        }
+        rows.push(Some(i));
+    }
+    let cursor = app.fx_cursor.min(Fx::ALL.len() - 1);
+    let at = rows.iter().position(|&r| r == Some(cursor)).unwrap_or(0);
+    // Show the group header with the first effect of a group.
+    let top = if at > 0 && rows[at - 1].is_none() {
+        at - 1
+    } else {
+        at
+    };
+    let visible = list.height as usize;
+    let max_scroll = rows.len().saturating_sub(visible);
+    if top < app.fx_scroll {
+        app.fx_scroll = top;
+    } else if at >= app.fx_scroll + visible {
+        app.fx_scroll = at + 1 - visible;
+    }
+    app.fx_scroll = app.fx_scroll.min(max_scroll);
+
+    let mut lines = Vec::with_capacity(visible);
+    for (n, row) in rows.iter().skip(app.fx_scroll).take(visible).enumerate() {
+        let y = list.y + n as u16;
+        match *row {
+            None => {
+                let i = rows[app.fx_scroll + n + 1].unwrap_or(0);
+                lines.push(Line::styled(
+                    format!(" {}", Fx::ALL[i].group().label()),
+                    Style::new().fg(DIM).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Some(i) => {
+                let fx = Fx::ALL[i];
+                let on = app.effects.is_on(fx);
+                let here = i == cursor;
+                let mark = if on {
+                    Span::styled("● ", Style::new().fg(ACCENT))
+                } else {
+                    Span::styled("○ ", Style::new().fg(DIM))
+                };
+                let name = Span::styled(
+                    fx.label(),
+                    if on {
+                        Style::new().fg(Color::White).bold()
+                    } else {
+                        Style::new().fg(Color::Gray)
+                    },
+                );
+                let line = Line::from(vec![
+                    Span::styled(if here { " ›" } else { "  " }, Style::new().fg(ACCENT)),
+                    Span::raw(" "),
+                    mark,
+                    name,
+                ]);
+                lines.push(if here {
+                    line.style(Style::new().bg(Color::Rgb(60, 14, 24)))
+                } else {
+                    line
+                });
+                app.fx_rows.push((y, i));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list);
+
+    // Scroll hints on the border when the list doesn't fit.
+    if app.fx_scroll > 0 {
+        f.render_widget(
+            Paragraph::new("▲").fg(DIM).alignment(Alignment::Right),
+            Rect {
+                y: list.y,
+                height: 1,
+                ..list
+            },
+        );
+    }
+    if app.fx_scroll < max_scroll {
+        f.render_widget(
+            Paragraph::new("▼").fg(DIM).alignment(Alignment::Right),
+            Rect {
+                y: list.bottom() - 1,
+                height: 1,
+                ..list
+            },
+        );
+    }
+
+    let about = Fx::ALL[cursor].about();
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "─".repeat(foot.width as usize),
+                Style::new().fg(Color::Rgb(70, 20, 30)),
+            ),
+            Line::styled(format!(" {about}"), Style::new().fg(Color::Gray)),
+            Line::styled(" spc toggle  c clear  e/esc", Style::new().fg(DIM)),
+        ]),
+        foot,
+    );
+}
+
+fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(p) = &app.player else { return };
     let [top, bottom] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -694,17 +895,55 @@ fn draw_hud(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Gray),
         ),
     ];
-    for fx in Fx::ALL {
-        let style = if app.effects.is_on(fx) {
-            Style::new().fg(Color::Black).bg(ACCENT)
+    // Names of the effects that are on, as many as fit before the menu button.
+    let button = Span::styled(
+        if app.fx_menu {
+            format!(" ▸ FX {} ", app.effects.count())
         } else {
-            Style::new().fg(DIM)
-        };
-        spans.push(Span::styled(format!("{}{}", fx.key(), fx.label()), style));
-        spans.push(Span::raw(" "));
+            format!(" ◂ FX {} ", app.effects.count())
+        },
+        if app.fx_menu {
+            Style::new().fg(Color::Black).bg(ACCENT).bold()
+        } else {
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Rgb(90, 14, 26))
+                .bold()
+        },
+    );
+    let help = Span::styled("? help ", Style::new().fg(DIM));
+    let room = (bottom.width as usize).saturating_sub(
+        spans.iter().map(Span::width).sum::<usize>() + button.width() + help.width() + 1,
+    );
+    let mut names = String::new();
+    for fx in app.effects.enabled() {
+        let more = if names.is_empty() { 0 } else { 1 };
+        if names.len() + more + fx.label().len() + 2 > room {
+            names.push_str(" …");
+            break;
+        }
+        if more == 1 {
+            names.push(' ');
+        }
+        names.push_str(fx.label());
     }
-    spans.push(Span::styled(" ? help", Style::new().fg(DIM)));
+    spans.push(Span::styled(names, Style::new().fg(ACCENT)));
     f.render_widget(Paragraph::new(Line::from(spans)), bottom);
+
+    let bw = (button.width() + help.width()) as u16;
+    if bottom.width > bw {
+        let rect = Rect {
+            x: bottom.right() - bw,
+            width: bw,
+            ..bottom
+        };
+        f.render_widget(Paragraph::new(Line::from(vec![help, button.clone()])), rect);
+        app.fx_button = Some(Rect {
+            x: bottom.right() - button.width() as u16,
+            width: button.width() as u16,
+            ..bottom
+        });
+    }
 }
 
 fn draw_help(f: &mut Frame, playing: bool) {
@@ -717,7 +956,11 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("b / tab", "browse while it keeps playing"),
             ("s", "toggle bass sync (off = steady fx + random hits)"),
             ("p / P", "next / previous preset"),
-            ("1-9 0 - =", "toggle individual effects"),
+            ("e / FX button", "effects menu: pick any of the effects"),
+            (
+                "  in the menu",
+                "↑↓ jk move, space/enter toggle, c clear all",
+            ),
             ("[ / ]", "effect intensity down / up"),
             ("← / →", "seek -10s / +10s"),
             ("↑ / ↓", "volume up / down"),
@@ -730,7 +973,10 @@ fn draw_help(f: &mut Frame, playing: bool) {
         ]
     } else {
         &[
-            ("1-5 / tab", "search, home, subscriptions, library, queue"),
+            (
+                "1-6 / tab",
+                "search, home, subscriptions, library, queue, history",
+            ),
             ("/ or i", "search (ctrl-t: videos / playlists / channels)"),
             ("enter", "play video / open playlist or channel"),
             ("esc / bksp / h", "back out of a playlist or channel"),
@@ -739,7 +985,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("R", "radio from a random video in this list"),
             ("S", "shuffle-play this list"),
             ("a", "add the selected video to the queue"),
-            ("x", "remove from the queue (queue tab)"),
+            ("x", "remove from the queue / forget from history"),
             ("u", "reload this list"),
             ("p", "preview pane on / off (wide terminals)"),
             ("L", "YouTube account (sign in / out)"),
@@ -748,7 +994,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("q / esc", "quit"),
         ]
     };
-    let mut lines: Vec<Line> = rows
+    let lines: Vec<Line> = rows
         .iter()
         .map(|(k, v)| {
             Line::from(vec![
@@ -757,19 +1003,6 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ])
         })
         .collect();
-    if playing {
-        lines.push(Line::raw(""));
-        let fx: Vec<String> = Fx::ALL
-            .iter()
-            .map(|fx| format!("{} {}", fx.key(), fx.label()))
-            .collect();
-        for chunk in fx.chunks(4) {
-            lines.push(Line::styled(
-                format!("  {}", chunk.join("   ")),
-                Style::new().fg(Color::Gray),
-            ));
-        }
-    }
     let rect = centered(f.area(), 68, lines.len() as u16 + 2);
     f.render_widget(Clear, rect);
     f.render_widget(
