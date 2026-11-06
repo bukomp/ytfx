@@ -205,7 +205,10 @@ fn browser_spec(browser: &str) -> String {
         "vivaldi" => &["vivaldi-stable.conf"],
         _ => &[],
     };
-    let store = files.iter().filter_map(|f| flags(f)).find_map(|t| password_store(&t));
+    let store = files
+        .iter()
+        .filter_map(|f| flags(f))
+        .find_map(|t| password_store(&t));
     let keyring = match store.as_deref() {
         Some("gnome-libsecret" | "gnome-keyring" | "gnome") => "gnomekeyring",
         Some("kwallet") => "kwallet",
@@ -235,6 +238,23 @@ fn cookie_read_error(stderr: &str) -> Option<&'static str> {
             "yt-dlp needs the Python `secretstorage` module to read the browser's cookies from \
              the GNOME keyring: install python-secretstorage (Arch) or python3-secretstorage \
              (Debian/Ubuntu)",
+        );
+    }
+    // secretstorage's LockedException: yt-dlp does not ask the keyring to unlock.
+    if stderr.contains("Item is locked") || stderr.contains("Collection is locked") {
+        return Some(
+            "the GNOME keyring is locked, so yt-dlp cannot read the browser's cookie key. \
+             Unlock it (open the browser, or unlock \"Login\" in Seahorse) and try again",
+        );
+    }
+    // secretstorage's ItemNotFoundException: the keyring lists an item that it cannot
+    // return. yt-dlp reads every item in the default collection, so one broken entry
+    // stops it before it reaches the browser's key.
+    if stderr.contains("Item does not exist") {
+        return Some(
+            "yt-dlp could not read the GNOME keyring: it lists an item that does not exist. \
+             Restart the keyring (systemctl --user restart gnome-keyring-daemon, or log out and \
+             in), or delete the broken entry in Seahorse",
         );
     }
     (stderr.contains("cannot decrypt") || stderr.contains("failed to decrypt")).then_some(
@@ -921,8 +941,13 @@ mod tests {
         assert_eq!(password_store(flags).as_deref(), Some("gnome-libsecret"));
         assert_eq!(password_store("--no-default-browser-check\n"), None);
         assert_eq!(browser_spec("firefox"), "firefox");
-        assert_eq!(browser_spec("chromium+kwallet6:Profile 1"), "chromium+kwallet6:Profile 1");
+        assert_eq!(
+            browser_spec("chromium+kwallet6:Profile 1"),
+            "chromium+kwallet6:Profile 1"
+        );
         assert!(cookie_read_error("WARNING: cannot decrypt v11 cookies: no key found").is_some());
+        assert!(cookie_read_error("ERROR: Item does not exist!").is_some());
+        assert!(cookie_read_error("ERROR: Item is locked!").is_some());
         assert!(cookie_read_error("ERROR: Login details are needed").is_none());
     }
 
