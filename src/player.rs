@@ -19,6 +19,10 @@ use crate::youtube::{Stream, StreamInfo};
 const MAX_ATTEMPTS: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_millis(1500);
 
+/// Let ffmpeg decode video on the GPU when it can (`-hwaccel auto`: NVDEC, VAAPI,
+/// VideoToolbox, ...; ffmpeg falls back to the CPU by itself). Set once at startup.
+pub static HW_DECODE: AtomicBool = AtomicBool::new(false);
+
 fn is_transient(err: &str) -> bool {
     err.contains("403")
 }
@@ -241,7 +245,7 @@ impl Drop for Player {
     }
 }
 
-fn ffmpeg(src: &Stream, start: f64) -> Command {
+fn ffmpeg(src: &Stream, start: f64, video: bool) -> Command {
     let mut cmd = Command::new("ffmpeg");
     // -nostdin is essential: otherwise ffmpeg reads our keypresses from the terminal.
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
@@ -265,6 +269,9 @@ fn ffmpeg(src: &Stream, start: f64) -> Command {
     }
     if start > 0.0 {
         cmd.arg("-ss").arg(format!("{start:.3}"));
+    }
+    if video && HW_DECODE.load(Relaxed) {
+        cmd.args(["-hwaccel", "auto"]);
     }
     cmd.arg("-i").arg(&src.url);
     cmd.stdin(Stdio::null())
@@ -295,7 +302,7 @@ fn spawn_audio(
     channels: u16,
     shared: Arc<AudioShared>,
 ) -> Result<Job> {
-    let mut cmd = ffmpeg(src, start);
+    let mut cmd = ffmpeg(src, start, false);
     cmd.args([
         "-vn",
         "-sn",
@@ -355,7 +362,7 @@ fn spawn_audio(
 }
 
 fn spawn_video(src: &Stream, start: f64, (w, h): (usize, usize), fps: u32) -> Result<VideoJob> {
-    let mut cmd = ffmpeg(src, start);
+    let mut cmd = ffmpeg(src, start, true);
     let filter = format!(
         "fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bilinear,\
          pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24"

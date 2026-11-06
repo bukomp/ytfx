@@ -2,6 +2,7 @@ mod account;
 mod analysis;
 mod audio;
 mod effects;
+mod gpu;
 mod graphics;
 mod history;
 mod kitty;
@@ -86,6 +87,8 @@ options:
   --renderer <name>  auto (default), kitty or sixel (pixel graphics), blocks (text cells)
   --max-width <n>    max video width in columns for the blocks renderer (default 200)
   --no-sync          start with sync off
+  --no-gpu           run the effects and video decoding on the CPU
+  --no-hwdec         decode video on the CPU (the effects still use the GPU)
   --volume <0-200>   start volume in percent (default 80)
   --cookies <file>   use a Netscape cookies.txt for this session only
   --cookies-from-browser <name>
@@ -136,6 +139,9 @@ struct Config {
     max_width: u16,
     sync: bool,
     volume: f32,
+    /// Effects on the GPU, and video decoding on the GPU.
+    gpu: bool,
+    hwdec: bool,
     initial: Option<String>,
     /// Cookies from the command line; they override the saved account.
     auth: Option<youtube::Auth>,
@@ -149,6 +155,8 @@ fn parse_args() -> Result<Config> {
         max_width: 200,
         sync: true,
         volume: 0.8,
+        gpu: true,
+        hwdec: true,
         initial: None,
         auth: None,
     };
@@ -187,6 +195,8 @@ fn parse_args() -> Result<Config> {
                 }
             }
             "--no-sync" => cfg.sync = false,
+            "--no-gpu" => (cfg.gpu, cfg.hwdec) = (false, false),
+            "--no-hwdec" => cfg.hwdec = false,
             "--volume" => {
                 cfg.volume = args
                     .next()
@@ -1269,6 +1279,9 @@ impl App {
                 .unwrap_or((0, 0, f.w, f.h));
             self.effects
                 .render(&f.data, f.w, f.h, self.drive, dt, &mut self.fx_out);
+            if let Some(why) = self.effects.gpu_failure() {
+                self.status = Some((format!("effects run on the CPU: {why}"), false));
+            }
             match self.fill_canvas(area, f.w, f.h, crop) {
                 Some((cw, ch)) => {
                     self.backdrop.compose(
@@ -2290,6 +2303,10 @@ fn pick_graphics(choice: RendererChoice) -> Option<Graphics> {
 fn setup_terminal() -> Result<Term> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The GPU code catches its own panics and falls back to the CPU; the app goes on.
+        if gpu::in_gpu_code() {
+            return;
+        }
         restore_terminal();
         hook(info);
     }));
@@ -2346,7 +2363,12 @@ fn main() -> Result<()> {
 
     let mut term = setup_terminal()?;
     let graphics = pick_graphics(cfg.renderer);
+    player::HW_DECODE.store(cfg.hwdec, std::sync::atomic::Ordering::Relaxed);
+    let gpu = cfg.gpu;
     let mut app = App::new(cfg, audio, signed_in, graphics);
+    if gpu {
+        app.effects.use_gpu();
+    }
     if startup_error.is_some() {
         app.status = startup_error;
     }

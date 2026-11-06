@@ -1,12 +1,13 @@
 # ytfx
 
-A terminal YouTube browser. It searches with `yt-dlp` (no API key), plays the video in the terminal with audio (as real pixels in kitty, Ghostty and WezTerm, as sixel images in foot and other sixel terminals, or as truecolor half-block characters elsewhere), and layers 37 "edit"-style effects on top (zoom punches, shake, glitches, colour grades, VHS, CRT, film and more), picked from a side menu. With SYNC on, the effects are driven by the frequency slices that are on (by default the bass, 0-150 Hz). Press `s` to turn SYNC off; the effects then stay at a steady level with random hits.
+A terminal YouTube browser. It searches with `yt-dlp` (no API key), plays the video in the terminal with audio (as real pixels in kitty, Ghostty and WezTerm, as sixel images in foot and other sixel terminals, or as truecolor half-block characters elsewhere), and layers 37 "edit"-style effects on top (zoom punches, shake, glitches, colour grades, VHS, CRT, film and more), picked from a side menu. The effects run on the GPU when there is one (see GPU). With SYNC on, the effects are driven by the frequency slices that are on (by default the bass, 0-150 Hz). Press `s` to turn SYNC off; the effects then stay at a steady level with random hits.
 
 ## Requirements
 
 - Rust toolchain
 - `yt-dlp` and `ffmpeg` on `PATH` (`brew install yt-dlp ffmpeg`)
 - A truecolor terminal (kitty, WezTerm, iTerm2, Ghostty, ...)
+- Optional: a GPU with Vulkan (Linux) or Metal (macOS) drivers. Without one, the effects run on the CPU.
 
 ## Run
 
@@ -25,6 +26,8 @@ Options (`ytfx [options] [search terms | youtube url]`):
 --renderer <name>  auto (default), kitty or sixel (pixel graphics), blocks (text cells)
 --max-width <n>    max video width in columns for the blocks renderer (default 200)
 --no-sync          start with sync off
+--no-gpu           run the effects and video decoding on the CPU
+--no-hwdec         decode video on the CPU (the effects still use the GPU)
 --volume <0-200>   start volume in percent (default 80)
 --cookies <file>   use a Netscape cookies.txt for this session only
 --cookies-from-browser <name>
@@ -259,9 +262,27 @@ There are three renderers:
 - **Graphics (sixel):** used automatically in terminals that report sixel support (foot, mlterm, xterm with sixel, Windows Terminal...). ytfx asks the terminal at startup, so it works whatever `TERM` says. The terminal doesn't scale sixel images, so ytfx resamples each frame to the pixel size of the video area, maps it to 252 colours with ordered dithering, and sends it as one image (about 0.7 MB and 10 ms per frame for a 1280x720 area). `r` / `R` set the source resolution, as with kitty. A paused frame is not sent again.
 - **Blocks:** used everywhere else, and inside tmux. Each cell shows two pixels with the `▀` character, so the resolution is the terminal grid. For example, 200 columns gives a 200x112 picture. To get more detail, make the font smaller.
 
-The source stream is fetched at 720p or at the chosen resolution, whichever is higher. At 720p, each preset takes about 0.7 to 3.2 ms per frame, and no single effect takes more than about 1.5 ms. With all 37 effects on at once, it takes about 3.7 ms at 360p, 14 ms at 720p and 32 ms at 1080p. Blur and glow run at reduced resolution, per-channel curves (poster, solar, strobe, flash, invert) are combined into one pass, and history buffers exist only while their effect is on. While paused, the effects stop running once the last hit has faded, until something changes (a seek, another effect, a resize). With no effects on, it costs almost nothing.
+The source stream is fetched at 720p or at the chosen resolution, whichever is higher. On the GPU, each preset takes about 0.5 ms per frame at 720p and 1 ms at 1080p, mostly to copy the frame to the GPU and back (see GPU). On the CPU, at 720p, each preset takes about 0.7 to 3.2 ms per frame, and no single effect takes more than about 1.5 ms. With all 37 effects on at once, the CPU takes about 3.7 ms at 360p, 14 ms at 720p and 32 ms at 1080p. Blur and glow run at reduced resolution, per-channel curves (poster, solar, strobe, flash, invert) are combined into one pass, and history buffers exist only while their effect is on. While paused, the effects stop running once the last hit has faded, until something changes (a seek, another effect, a resize). With no effects on, it costs almost nothing.
 
 When the video doesn't fill its area (another aspect ratio, or smaller than the window), ytfx fills the empty space with a zoomed, blurred and darkened copy of the video. `f` turns this off.
+
+## GPU
+
+The effects run as compute shaders on the GPU, through wgpu (Vulkan or Metal). ytfx starts the GPU in the background at startup. Until it is ready, the effects run on the CPU. Each frame goes to the GPU once, all effects run there, and the result comes back for the renderer. The GPU runs the same steps with the same random choices as the CPU. Most effects give exactly the same pixels. The resampling effects (zoom, spin, bulge, tunnel) and the vignette use floating point, so a few pixels can differ slightly.
+
+Measured on an RTX 4070 Ti SUPER (`cargo test --release bench_gpu -- --ignored --nocapture`):
+
+| Frame | All 37 effects, CPU | All 37 effects, GPU | Presets, CPU | Presets, GPU |
+| --- | --- | --- | --- | --- |
+| 854x480 | 17 ms | 0.4 ms | 0.9-4.2 ms | 0.2-0.3 ms |
+| 1280x720 | 38 ms | 0.7 ms | 1.9-9.3 ms | 0.4-0.5 ms |
+| 1920x1080 | 84 ms | 1.6 ms | 4.1-21 ms | 1.0-1.1 ms |
+
+ffmpeg also decodes the video on the GPU when it can (`-hwaccel auto`: NVDEC, VAAPI, VideoToolbox and others). If the GPU can't decode the stream, ffmpeg uses the CPU. GPU decoding takes about 0.1 s longer to start, at each new video and each seek.
+
+The HUD shows `gpu` or `cpu` after the renderer name. The settings tab (`7`) shows the GPU's name, or why the effects run on the CPU. If the GPU fails while a video plays (a driver error, a lost device), ytfx shows a message and continues on the CPU. Software renderers (such as llvmpipe) are not used; the CPU code runs instead.
+
+`--no-gpu` turns off both. `--no-hwdec` turns off only the video decoding.
 
 ## How the sync works
 
@@ -287,7 +308,8 @@ Video frames are scheduled against the audio clock (samples actually played, min
 - `src/player.rs`: ffmpeg video and audio decoders, A/V sync, seek, resize
 - `src/audio.rs`: cpal output, volume, and the tap of played samples
 - `src/analysis.rs`: FFT, slice levels, per-slice beat detection
-- `src/effects.rs`: effect pipeline, presets, effect catalogue (groups, descriptions)
+- `src/effects.rs`: effect pipeline, presets, effect catalogue (groups, descriptions). Each frame's effects become a list of steps, with all random choices made, which runs on the CPU here or on the GPU
+- `src/gpu.rs`, `src/effects.wgsl`: the GPU side of the effects (wgpu device, compute shaders, CPU fallback)
 - `src/graphics.rs`: picks between the kitty and sixel output
 - `src/kitty.rs`: kitty graphics protocol output (shared memory or inline base64)
 - `src/sixel.rs`: sixel output (terminal probe, resampling, dithering, encoder)
@@ -302,7 +324,8 @@ Video frames are scheduled against the audio clock (samples actually played, min
   4. Press `L` and choose `b` to let yt-dlp read your browser's cookie store. On macOS, Chromium browsers ask for Keychain access to decrypt it. Use this only if you are comfortable with that.
 - "YouTube says this sign-in is no longer valid" or empty Home / Subscriptions: a browser that is signed in to Google refreshes the whole Google session in the background, even with no YouTube tab open, and that invalidates exported copies. Export from a private window instead: sign in to YouTube, open `https://www.youtube.com/robots.txt` in the same tab, export the youtube.com cookies, and close the private window right away. Then import the file with `L` → `f`, or copy it to `~/.config/ytfx/cookies.txt`. That session belongs to ytfx alone, and ytfx keeps it fresh by saving the cookies YouTube updates after each request.
 - Low resolution: in kitty, Ghostty, WezTerm or a sixel terminal such as foot, press `r`. If `g` says the terminal shows no pixel graphics, try `--renderer sixel`. In other terminals, the blocks renderer is limited by the cell grid (see Resolution).
-- Choppy video: lower the resolution (`R`), `--max-width` or `--fps`.
+- Choppy video: lower the resolution (`R`), `--max-width` or `--fps`. Make sure the effects run on the GPU: the HUD shows `gpu`, and the settings tab (`7`) shows why not.
+- The video doesn't start, or shows decoding errors, with a new or unusual GPU driver: try `--no-hwdec`.
 - Wrong or banded colors: the terminal probably lacks truecolor support. Use one that has it.
 
 ## Tests
@@ -310,6 +333,8 @@ Video frames are scheduled against the audio clock (samples actually played, min
 ```
 cargo test --release
 ```
+
+`gpu_matches_cpu` (`src/effects.rs`) runs every effect on the CPU and on the GPU and compares the frames. Without a GPU, it does nothing.
 
 Three tests are ignored by default because they need input files:
 

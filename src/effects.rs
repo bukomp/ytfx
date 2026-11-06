@@ -1,5 +1,8 @@
 //! "Edit" style frame effects. Everything works on packed RGB24 buffers, and every
-//! effect is scaled by the drive signal (the beat pulse when synced).
+//! effect is scaled by the drive signal (the beat pulse when synced). The effects run on
+//! the GPU (`gpu.rs`) when one is available, and on the CPU otherwise.
+
+use crate::gpu::GpuSlot;
 
 /// What the effects react to. `pulse` jumps on a beat (a hit in any frequency slice
 /// that is on) and decays, `level` follows the energy of those slices. `beat` is set
@@ -311,8 +314,6 @@ pub struct Effects {
     pub intensity: f32,
     rng: Rng,
     time: f32,
-    prev: Vec<u8>,
-    tmp: Vec<u8>,
     glitch_left: f32,
     glitch_seed: u64,
     invert_left: f32,
@@ -320,33 +321,21 @@ pub struct Effects {
     thermal_lut: [[u8; 3]; 256],
     vapor_lut: [[u8; 3]; 256],
     sepia_lut: [[u8; 3]; 256],
-    /// Vignette strength per pixel (0..=256) for the red grade, cached per frame size.
-    vignette: Vec<u16>,
-    vignette_size: (usize, usize),
     /// Grain values for VHS, read at random offsets instead of a fresh random per pixel.
     noise: Vec<i16>,
-    /// Running column sums for the blur's vertical pass.
-    sums: Vec<u32>,
     /// Frame held by stutter, and how long it still holds.
     held: Vec<u8>,
     stutter_left: f32,
-    /// Tunnel feedback: the previous tunnel output.
-    feedback: Vec<u8>,
-    /// Echo: two progressively slower copies of the picture.
-    lag1: Vec<u8>,
-    lag2: Vec<u8>,
-    /// Glow's bright pass, and edge detection's luminance.
-    scratch: Vec<u8>,
-    luma: Vec<u8>,
     spin_dir: f32,
     hue: f32,
     flash: f32,
     /// Channel order while swap holds (1..=SWAPS, see `swap_channels`), and for how long.
     swap_perm: usize,
     swap_left: f32,
-    /// Dither thresholds: 16 Bayer steps x 256 input values, for `dither_levels` levels.
-    dither_lut: Vec<u8>,
-    dither_levels: u32,
+    cpu: Cpu,
+    gpu: GpuSlot,
+    /// Whether `gpu_failure` reported the failure already.
+    gpu_told: bool,
 }
 
 /// Number of non-identity channel orders swap picks from.
@@ -372,10 +361,11 @@ fn chain(tone: &mut Option<[u8; 256]>, f: impl Fn(u8) -> u8) {
     *tone = Some(base.map(f));
 }
 
-/// Replace each pixel by `lut[luminance]`, mixed with the original by `amount` (0..1).
-fn grade(out: &mut [u8], lut: &[[u8; 3]; 256], amount: f32) {
-    let mix = (amount.clamp(0.0, 1.0) * 256.0) as u32;
-    if mix >= 256 {
+/// Mix each pixel with `lut[luminance]` by `mix` (0..=256), then darken it by the
+/// vignette (one factor of 256 per pixel), if given.
+fn grade(out: &mut [u8], lut: &[[u8; 3]; 256], mix: u32, vignette: Option<&[u16]>) {
+    let mix = mix.min(256);
+    if mix == 256 && vignette.is_none() {
         for px in out.chunks_exact_mut(3) {
             px.copy_from_slice(&lut[luma(px) as usize]);
         }
@@ -384,18 +374,45 @@ fn grade(out: &mut [u8], lut: &[[u8; 3]; 256], amount: f32) {
     // The table side of the mix, premultiplied.
     let pre: [[u16; 3]; 256] = std::array::from_fn(|l| lut[l].map(|t| (t as u32 * mix) as u16));
     let keep = 256 - mix;
-    for px in out.chunks_exact_mut(3) {
+    let graded = |px: &[u8]| -> [u32; 3] {
         let t = pre[luma(px) as usize];
-        for c in 0..3 {
-            px[c] = ((px[c] as u32 * keep + t[c] as u32) >> 8) as u8;
+        std::array::from_fn(|c| (px[c] as u32 * keep + t[c] as u32) >> 8)
+    };
+    match vignette {
+        None => {
+            for px in out.chunks_exact_mut(3) {
+                let g = graded(px);
+                for c in 0..3 {
+                    px[c] = g[c] as u8;
+                }
+            }
+        }
+        Some(vignette) => {
+            for (px, &v) in out.chunks_exact_mut(3).zip(vignette) {
+                let g = graded(px);
+                for c in 0..3 {
+                    px[c] = ((g[c] * v as u32) >> 8) as u8;
+                }
+            }
         }
     }
 }
 
-/// A random run of `w` grain values (the table is at least `w` long).
-fn noise_row<'a>(noise: &'a [i16], w: usize, rng: &mut Rng) -> &'a [i16] {
-    let start = rng.below(noise.len() - w + 1);
-    &noise[start..start + w]
+/// The run of `w` grain values that starts at `start`.
+fn noise_row(noise: &[i16], w: usize, start: u32) -> &[i16] {
+    &noise[start as usize..][..w]
+}
+
+/// Swap colour channels in one of the SWAPS non-identity orders (1..=SWAPS).
+fn swap(out: &mut [u8], perm: usize) {
+    match perm {
+        1 => swap_channels::<1, 2, 0>(out),
+        2 => swap_channels::<2, 0, 1>(out),
+        3 => swap_channels::<0, 2, 1>(out),
+        4 => swap_channels::<2, 1, 0>(out),
+        5 => swap_channels::<1, 0, 2>(out),
+        _ => {}
+    }
 }
 
 /// Swap colour channels: output channel 0 takes input channel A, and so on.
@@ -419,8 +436,6 @@ impl Effects {
             intensity: 1.0,
             rng: Rng::new(0x9e37_79b9_7f4a_7c15),
             time: 0.0,
-            prev: Vec::new(),
-            tmp: Vec::new(),
             glitch_left: 0.0,
             glitch_seed: 1,
             invert_left: 0.0,
@@ -445,29 +460,22 @@ impl Effects {
                 (0.5, [150, 110, 70]),
                 (1.0, [255, 240, 205]),
             ]),
-            vignette: Vec::new(),
-            vignette_size: (0, 0),
             noise: {
                 let mut r = Rng::new(0x51f1_5eed);
                 (0..NOISE_LEN)
                     .map(|_| (r.signed() * 256.0) as i16)
                     .collect()
             },
-            sums: Vec::new(),
             held: Vec::new(),
             stutter_left: 0.0,
-            feedback: Vec::new(),
-            lag1: Vec::new(),
-            lag2: Vec::new(),
-            scratch: Vec::new(),
-            luma: Vec::new(),
             spin_dir: 1.0,
             hue: 0.0,
             flash: 0.0,
             swap_perm: 0,
             swap_left: 0.0,
-            dither_lut: Vec::new(),
-            dither_levels: 0,
+            cpu: Cpu::default(),
+            gpu: GpuSlot::default(),
+            gpu_told: false,
         };
         e.apply_preset(preset);
         e
@@ -502,11 +510,9 @@ impl Effects {
 
     /// Forget per-video state (trail history, running glitches, held frames).
     pub fn reset(&mut self) {
-        self.prev.clear();
+        self.cpu.forget();
+        self.gpu.forget();
         self.held.clear();
-        self.feedback.clear();
-        self.lag1.clear();
-        self.lag2.clear();
         self.glitch_left = 0.0;
         self.invert_left = 0.0;
         self.stutter_left = 0.0;
@@ -514,11 +520,31 @@ impl Effects {
         self.flash = 0.0;
     }
 
-    fn vignette_for(&mut self, w: usize, h: usize) {
-        if self.vignette_size != (w, h) {
-            self.vignette = vignette(w, h);
-            self.vignette_size = (w, h);
+    /// Start the GPU backend in the background. Frames use the CPU until it is ready,
+    /// and again if it fails.
+    pub fn use_gpu(&mut self) {
+        self.gpu.start();
+    }
+
+    /// Where the effects run: "gpu (adapter name)", or "cpu (why not the GPU)".
+    pub fn backend(&mut self) -> String {
+        self.gpu.get();
+        self.gpu.status()
+    }
+
+    /// Whether the effects run on the GPU.
+    pub fn on_gpu(&self) -> bool {
+        self.gpu.is_ready()
+    }
+
+    /// Why the GPU stopped being used: once, the first time this is asked after it failed.
+    pub fn gpu_failure(&mut self) -> Option<String> {
+        if self.gpu_told {
+            return None;
         }
+        let why = self.gpu.failure()?.to_string();
+        self.gpu_told = true;
+        Some(why)
     }
 
     pub fn render(&mut self, src: &[u8], w: usize, h: usize, d: Drive, dt: f32, out: &mut Vec<u8>) {
@@ -528,23 +554,18 @@ impl Effects {
         }
         let src = &src[..n];
         out.resize(n, 0);
-        self.tmp.resize(n, 0);
         self.time += dt;
+        // Pick up the device as soon as it is ready (even while only copying frames, so
+        // the HUD shows where the effects will run).
+        self.gpu.get();
 
-        let on = self.enabled;
-        let on = |fx: Fx| on[fx as usize];
+        let enabled = self.enabled;
+        let on = |fx: Fx| enabled[fx as usize];
         // Free the history buffers of effects that are off (a full frame each).
-        for (fx, buf) in [
-            (Fx::Trails, &mut self.prev),
-            (Fx::Tunnel, &mut self.feedback),
-            (Fx::Echo, &mut self.lag1),
-            (Fx::Echo, &mut self.lag2),
-            (Fx::Stutter, &mut self.held),
-            (Fx::Edges, &mut self.luma),
-        ] {
-            if !on(fx) && buf.capacity() > 0 {
-                *buf = Vec::new();
-            }
+        self.cpu.free_unused(&enabled);
+        self.gpu.free_unused(&enabled);
+        if !on(Fx::Stutter) && self.held.capacity() > 0 {
+            self.held = Vec::new();
         }
         if self.noise.len() <= w {
             let mut r = Rng::new(0x51f1_5eed);
@@ -553,9 +574,6 @@ impl Effects {
                 .collect();
         }
         let i = self.intensity;
-        let p = (d.pulse * i).min(2.0);
-        // Effects were tuned at 200 px wide; distances in pixels scale with the resolution.
-        let px = (w as f32 / 200.0).max(1.0);
 
         if d.beat {
             if on(Fx::Glitch) && self.rng.f32() < 0.4 + 0.6 * d.strength {
@@ -585,11 +603,38 @@ impl Effects {
         self.flash *= (-dt * 10.0).exp();
         self.hue += dt * 0.35 * i;
 
+        let steps = self.plan(w, h, d);
         let src = if on(Fx::Stutter) && self.stutter_left > 0.0 && self.held.len() == n {
             &self.held[..]
         } else {
             src
         };
+        // A bare copy (no effects) costs more as a GPU round trip than on the CPU.
+        let trivial = matches!(&steps[..], [Step::Warp(warp)] if warp.is_identity());
+        if !trivial && let Some(gpu) = self.gpu.get() {
+            match gpu.run(src, w, h, &steps, &self.noise, out) {
+                Ok(true) => {
+                    self.cpu.forget();
+                    return;
+                }
+                // Too big for the GPU's limits: this frame size runs on the CPU.
+                Ok(false) => {}
+                Err(why) => self.gpu.fail(why),
+            }
+        }
+        self.gpu.forget();
+        self.cpu.run(src, w, h, &steps, &self.noise, out);
+    }
+
+    /// This frame's effect chain, in order, with every random choice made.
+    fn plan(&mut self, w: usize, h: usize, d: Drive) -> Vec<Step> {
+        let on = self.enabled;
+        let on = |fx: Fx| on[fx as usize];
+        let i = self.intensity;
+        let p = (d.pulse * i).min(2.0);
+        // Effects were tuned at 200 px wide; distances in pixels scale with the resolution.
+        let px = (w as f32 / 200.0).max(1.0);
+        let mut steps = Vec::new();
 
         // Geometry: zoom, shake, bounce, spin, bulge and mirrors in one resampling pass.
         let mut warp = Warp {
@@ -618,189 +663,175 @@ impl Effects {
         if on(Fx::Bulge) {
             warp.bulge = (0.15 + 0.45 * p).min(0.85);
         }
-        geometry(src, out, w, h, &warp);
+        steps.push(Step::Warp(warp));
 
         if on(Fx::Wave) {
             let amp = (0.6 + 5.0 * p) * px;
             let freq = std::f32::consts::TAU * 2.5 / h as f32;
-            for (y, row) in out.chunks_exact_mut(w * 3).enumerate() {
-                let off = (self.time * 5.0 + y as f32 * freq).sin() * amp;
-                shift_row(row, off.round() as isize);
-            }
+            let time = self.time;
+            steps.push(Step::Shift(
+                (0..h)
+                    .map(|y| ((time * 5.0 + y as f32 * freq).sin() * amp).round() as i32)
+                    .collect(),
+            ));
         }
         if on(Fx::Tunnel) {
-            prime(&mut self.feedback, out);
-            let zoom = 1.035 + 0.05 * p;
-            // No rotation: a plain zoom takes the fast resampling path.
-            let fb = Warp {
-                zoom,
-                ..Warp::default()
-            };
-            geometry(&self.feedback, &mut self.tmp, w, h, &fb);
-            let k = (0.62 * i).min(0.86) * (1.0 - 0.35 * d.pulse.min(1.0));
-            blend(out, &self.tmp, k);
-            self.feedback.copy_from_slice(out);
+            steps.push(Step::Tunnel {
+                zoom: 1.035 + 0.05 * p,
+                k: (0.62 * i).min(0.86) * (1.0 - 0.35 * d.pulse.min(1.0)),
+            });
         }
         if on(Fx::Trails) {
             // Smear into the previous output, but let beats cut through sharply.
-            prime(&mut self.prev, out);
-            let k = (0.55 * i).min(0.85) * (1.0 - 0.6 * d.pulse.min(1.0));
-            blend(out, &self.prev, k);
-            self.prev.copy_from_slice(out);
+            steps.push(Step::Trails {
+                k: (0.55 * i).min(0.85) * (1.0 - 0.6 * d.pulse.min(1.0)),
+            });
         }
         if on(Fx::Echo) {
-            prime(&mut self.lag1, out);
-            prime(&mut self.lag2, out);
-            // lag1 follows the picture, lag2 follows lag1; green shows lag1, blue lag2.
-            let k = ((0.45 * i).min(0.8) * 256.0) as u32;
-            let lerp = |a: u8, b: u8| ((a as u32 * k + b as u32 * (256 - k)) >> 8) as u8;
-            for ((o, a), b) in out.iter().zip(&mut self.lag1).zip(&mut self.lag2) {
-                *a = lerp(*a, *o);
-                *b = lerp(*b, *a);
-            }
-            for ((o, a), b) in out
-                .chunks_exact_mut(3)
-                .zip(self.lag1.chunks_exact(3))
-                .zip(self.lag2.chunks_exact(3))
-            {
-                o[1] = a[1];
-                o[2] = b[2];
-            }
+            steps.push(Step::Echo {
+                k: ((0.45 * i).min(0.8) * 256.0) as u32,
+            });
         }
 
         if on(Fx::Blur) {
             let radius = ((0.6 + 4.0 * p) * px).round() as usize;
             let radius = radius.min((10.0 * px) as usize);
-            soft_blur(
-                out,
-                &mut self.scratch,
-                &mut self.tmp,
-                &mut self.sums,
-                w,
-                h,
-                radius,
-            );
+            if radius > 0 {
+                steps.push(Step::Blur { radius });
+            }
         }
         if on(Fx::Glow) {
-            let gain = (0.5 + 0.9 * p) * i.min(1.5);
-            let radius = ((2.5 + 4.0 * p) * px).round() as usize;
-            glow(
-                out,
-                &mut self.scratch,
-                &mut self.tmp,
-                &mut self.sums,
-                w,
-                h,
-                radius,
-                gain,
-            );
+            steps.push(Step::Glow {
+                radius: ((2.5 + 4.0 * p) * px).round() as usize,
+                gain: (0.5 + 0.9 * p) * i.min(1.5),
+            });
         }
         if on(Fx::Split) {
             let off = ((0.5 + 6.0 * p) * px).round() as isize;
-            rgb_split(out, &mut self.tmp, w, h, off);
+            if off != 0 {
+                steps.push(Step::Split { off });
+            }
         }
         if on(Fx::Slice) && p > 0.02 {
             let bands = 9;
-            let shift = w as f32 * 0.08 * p.min(1.5);
-            for (y, row) in out.chunks_exact_mut(w * 3).enumerate() {
-                let band = y * bands / h;
-                let dir = if band.is_multiple_of(2) { 1.0 } else { -1.0 };
-                shift_row(row, (dir * shift).round() as isize);
-            }
+            let shift = (w as f32 * 0.08 * p.min(1.5)).round() as i32;
+            steps.push(Step::Shift(
+                (0..h)
+                    .map(|y| {
+                        if (y * bands / h).is_multiple_of(2) {
+                            shift
+                        } else {
+                            -shift
+                        }
+                    })
+                    .collect(),
+            ));
         }
 
         if on(Fx::Red) {
             let amount = ((0.55 + 0.45 * d.pulse) * i.min(1.0)).clamp(0.0, 1.0);
-            self.vignette_for(w, h);
-            red_grade(out, &self.vignette, &self.red_lut, amount);
+            steps.push(Step::Grade {
+                lut: Box::new(self.red_lut),
+                mix: (amount * 256.0) as u32,
+                vignette: true,
+            });
         }
         if on(Fx::Noir) {
             // An S-curve that gets harder on hits.
             let k = 4.0 + 6.0 * p;
-            let gray: [u8; 256] = std::array::from_fn(|v| {
+            let lut = std::array::from_fn(|v| {
                 let x = v as f32 / 255.0 - 0.5;
                 let y = 0.5 + 0.5 * (x * k).tanh() / (0.5 * k).tanh();
-                (y.clamp(0.0, 1.0) * 255.0) as u8
+                [(y.clamp(0.0, 1.0) * 255.0) as u8; 3]
             });
-            for px in out.chunks_exact_mut(3) {
-                let g = gray[luma(px) as usize];
-                px.copy_from_slice(&[g, g, g]);
-            }
+            steps.push(Step::Grade {
+                lut: Box::new(lut),
+                mix: 256,
+                vignette: false,
+            });
         }
         if on(Fx::Thermal) {
             // Hits heat everything up a little.
             let lift = (40.0 * p) as usize;
-            let lut: [[u8; 3]; 256] =
-                std::array::from_fn(|v| self.thermal_lut[(v + lift).min(255)]);
-            grade(out, &lut, 1.0);
+            let lut = std::array::from_fn(|v| self.thermal_lut[(v + lift).min(255)]);
+            steps.push(Step::Grade {
+                lut: Box::new(lut),
+                mix: 256,
+                vignette: false,
+            });
         }
         if on(Fx::Vapor) {
-            grade(out, &self.vapor_lut, (0.7 + 0.3 * p) * i.min(1.0));
+            let amount = ((0.7 + 0.3 * p) * i.min(1.0)).clamp(0.0, 1.0);
+            steps.push(Step::Grade {
+                lut: Box::new(self.vapor_lut),
+                mix: (amount * 256.0) as u32,
+                vignette: false,
+            });
         }
         if on(Fx::Hue) {
-            hue_rotate(out, self.hue);
+            steps.push(Step::Hue(hue_matrix(self.hue)));
         }
-        if on(Fx::Swap) && self.swap_left > 0.0 {
-            match self.swap_perm {
-                1 => swap_channels::<1, 2, 0>(out),
-                2 => swap_channels::<2, 0, 1>(out),
-                3 => swap_channels::<0, 2, 1>(out),
-                4 => swap_channels::<2, 1, 0>(out),
-                5 => swap_channels::<1, 0, 2>(out),
-                _ => {}
-            }
+        if on(Fx::Swap) && self.swap_left > 0.0 && (1..=SWAPS).contains(&self.swap_perm) {
+            steps.push(Step::Swap(self.swap_perm));
         }
 
         if on(Fx::Glitch) && self.glitch_left > 0.0 {
-            glitch(
-                out,
-                &mut self.tmp,
+            steps.push(Step::Glitch(glitch_plan(
                 w,
                 h,
                 self.glitch_seed,
                 &mut self.rng,
                 i.min(1.5),
-            );
+            )));
         }
         if on(Fx::Static) {
             let amount = ((0.07 + 0.55 * p) * i.min(1.5)).min(0.9);
-            snow(out, w, amount, &self.noise, &mut self.rng);
+            steps.push(Step::Snow {
+                a: (amount.clamp(0.0, 1.0) * 256.0) as i32,
+                rows: self.noise_rows(w, h),
+            });
         }
         if on(Fx::Edges) {
-            edges(out, &mut self.luma, w, h, 1.6 + 2.0 * p);
+            steps.push(Step::Edges {
+                gain: ((1.6 + 2.0 * p) * 256.0) as i32,
+            });
         }
         if on(Fx::Pixel) {
             let block = ((2.0 + 6.0 * p) * px).round() as usize;
-            pixelate(out, w, h, block);
+            if block >= 2 {
+                steps.push(Step::Pixel { block });
+            }
         }
         if on(Fx::Dither) {
-            let levels = if p > 0.6 { 2 } else { 3 };
-            let cell = (px * 0.5).round().max(1.0) as usize;
-            if self.dither_levels != levels {
-                self.dither_lut = dither_table(levels);
-                self.dither_levels = levels;
-            }
-            dither(out, w, &self.dither_lut, cell);
+            steps.push(Step::Dither {
+                levels: if p > 0.6 { 2 } else { 3 },
+                cell: (px * 0.5).round().max(1.0) as usize,
+            });
         }
         if on(Fx::Vhs) {
-            vhs(out, w, h, self.time, p, i, px, &self.noise, &mut self.rng);
+            steps.push(self.vhs_plan(w, h, p, px));
         }
         if on(Fx::Crt) {
-            crt(out, w, px, p);
+            steps.push(Step::Crt {
+                line: (px * 0.5).round().max(1.0) as usize,
+                cell: (px * 0.34).round().max(1.0) as usize,
+                boost: (256.0 * (1.15 + 0.35 * p)) as u32,
+            });
         }
         if on(Fx::Film) {
-            film(out, w, h, &self.sepia_lut, &self.noise, &mut self.rng, p, i);
+            steps.push(Step::Film(self.film_plan(w, h, p)));
         }
         if on(Fx::Vignette) {
-            self.vignette_for(w, h);
             let k = ((0.5 + 0.9 * p) * i.min(1.5)).min(1.6);
-            darken_edges(out, &self.vignette, k);
+            steps.push(Step::Darken {
+                k: (k * 256.0) as u32,
+            });
         }
         if on(Fx::Cinema) {
             let bar = ((0.07 + 0.09 * p.min(1.2)) * h as f32) as usize;
-            let bar = bar.min(h / 2);
-            out[..bar * w * 3].fill(0);
-            out[(h - bar) * w * 3..].fill(0);
+            steps.push(Step::Cinema {
+                bar: bar.min(h / 2),
+            });
         }
         // Per-channel curves are composed into one table and applied in a single pass.
         let mut tone = None;
@@ -826,34 +857,413 @@ impl Effects {
         if on(Fx::Invert) && self.invert_left > 0.0 {
             chain(&mut tone, |v| 255 - v);
         }
-        let only_invert = tone.is_some_and(|t| t[0] == 255 && t[255] == 0)
-            && !on(Fx::Poster)
-            && !on(Fx::Solar)
-            && !on(Fx::Strobe)
-            && !(on(Fx::Flash) && self.flash > 0.02);
-        if only_invert {
-            for v in out.iter_mut() {
-                *v = 255 - *v;
+        if let Some(lut) = tone {
+            steps.push(Step::Tone(Box::new(lut)));
+        }
+        steps
+    }
+
+    /// A random window into the grain table for each of `h` rows of `w` pixels.
+    fn noise_rows(&mut self, w: usize, h: usize) -> Vec<u32> {
+        let span = self.noise.len() - w + 1;
+        (0..h).map(|_| self.rng.below(span) as u32).collect()
+    }
+
+    /// Tape look: wobbling rows, a rolling tracking band, scanlines and grain.
+    fn vhs_plan(&mut self, w: usize, h: usize, p: f32, px: f32) -> Step {
+        let (time, i) = (self.time, self.intensity);
+        let band = ((time * 0.23).fract() * h as f32) as isize;
+        let band_half = (3.0 * px) as isize;
+        let span = self.noise.len() - w + 1;
+        let rows = (0..h)
+            .map(|y| {
+                let mut off = (time * 9.0 + y as f32 * 0.21 / px).sin() * (0.4 + 1.5 * p) * px;
+                let in_band = (y as isize - band).abs() < band_half;
+                if in_band {
+                    off += self.rng.signed() * 6.0 * i * px;
+                }
+                VhsRow {
+                    off: off.round() as i32,
+                    start: self.rng.below(span) as u32,
+                    lift: if in_band { 25 } else { 0 },
+                }
+            })
+            .collect();
+        Step::Vhs {
+            line: (px * 0.5).round().max(1.0) as usize,
+            // Grain amplitude in 1/256 steps (noise values are -256..256).
+            grain: (10.0 * i) as i32,
+            rows,
+        }
+    }
+
+    /// Old film: sepia, flicker, grain, and now and then a scratch or a dust speck.
+    fn film_plan(&mut self, w: usize, h: usize, p: f32) -> FilmPlan {
+        let i = self.intensity;
+        let flicker = 1.0 + self.rng.signed() * 0.05 + 0.15 * p;
+        // Sepia with this frame's flicker.
+        let lut = std::array::from_fn(|v| self.sepia_lut[((v as f32 * flicker) as usize).min(255)]);
+        let rows = self.noise_rows(w, h);
+        let scratches = (0..self.rng.below(3)).map(|_| self.rng.below(w)).collect();
+        let dust = (0..self.rng.below(4))
+            .map(|_| (self.rng.below(w), self.rng.below(h)))
+            .collect();
+        FilmPlan {
+            lut: Box::new(lut),
+            mix: ((0.85 * i).min(1.0) * 256.0) as i32,
+            grain: (18.0 * i) as i32,
+            rows,
+            scratches,
+            dust,
+            size: (w / 160).max(1),
+        }
+    }
+}
+
+/// One step of a frame's effect chain, with every random choice already made, so the CPU
+/// (`Cpu::run`) and the GPU (`gpu.rs`) run exactly the same chain. The first step is
+/// always a `Warp` from the source frame; every later one works on the result so far.
+pub(crate) enum Step {
+    Warp(Warp),
+    /// Shift each row right by its offset (left if negative), repeating the edge pixel.
+    Shift(Vec<i32>),
+    /// Mix in a zoomed copy of the previous tunnel output by `k`.
+    Tunnel {
+        zoom: f32,
+        k: f32,
+    },
+    /// Mix in the previous trails output by `k`.
+    Trails {
+        k: f32,
+    },
+    /// Green and blue follow the picture with a lag (`k` of 256 is how much they keep).
+    Echo {
+        k: u32,
+    },
+    Blur {
+        radius: usize,
+    },
+    Glow {
+        radius: usize,
+        gain: f32,
+    },
+    /// Red shifted right and down by `off` (down by off / 3), blue the other way.
+    Split {
+        off: isize,
+    },
+    /// Mix each pixel with `lut[luminance]` by `mix` of 256, then darken it by the
+    /// vignette if `vignette` is set.
+    Grade {
+        lut: Box<[[u8; 3]; 256]>,
+        mix: u32,
+        vignette: bool,
+    },
+    /// Fixed-point (1.0 = 256) colour matrix.
+    Hue([[i32; 3]; 3]),
+    /// Channel order 1..=SWAPS (see `swap`).
+    Swap(usize),
+    Glitch(GlitchPlan),
+    /// TV snow mixed in by `a` of 256; `rows` are each row's start in the grain table.
+    Snow {
+        a: i32,
+        rows: Vec<u32>,
+    },
+    /// Sobel edge strength x `gain` / 256 lights the picture's own colours.
+    Edges {
+        gain: i32,
+    },
+    Pixel {
+        block: usize,
+    },
+    Dither {
+        levels: u32,
+        cell: usize,
+    },
+    Vhs {
+        line: usize,
+        grain: i32,
+        rows: Vec<VhsRow>,
+    },
+    Crt {
+        line: usize,
+        cell: usize,
+        boost: u32,
+    },
+    Film(FilmPlan),
+    /// Darken towards the edges by `k` / 256 times the vignette.
+    Darken {
+        k: u32,
+    },
+    /// Black bars of `bar` rows at the top and bottom.
+    Cinema {
+        bar: usize,
+    },
+    /// One curve for every channel.
+    Tone(Box<[u8; 256]>),
+}
+
+/// Per row of the VHS effect: its shift, its start in the grain table, and the extra
+/// brightness of the tracking band.
+pub(crate) struct VhsRow {
+    pub off: i32,
+    pub start: u32,
+    pub lift: i32,
+}
+
+pub(crate) struct FilmPlan {
+    /// Sepia with this frame's flicker, mixed in by `mix` of 256.
+    pub lut: Box<[[u8; 3]; 256]>,
+    pub mix: i32,
+    pub grain: i32,
+    /// Each row's start in the grain table.
+    pub rows: Vec<u32>,
+    /// Columns of the scratches, and top-left corners of `size` x `size` dust specks.
+    pub scratches: Vec<usize>,
+    pub dust: Vec<(usize, usize)>,
+    pub size: usize,
+}
+
+/// Datamosh layout: displaced slices (some with swapped channels), moved blocks, noise
+/// rows. All of them read the frame as it was before the glitch, and later ones win.
+pub(crate) struct GlitchPlan {
+    pub slices: Vec<GlitchSlice>,
+    /// Source x, source y, destination x, destination y, width, height.
+    pub blocks: Vec<[usize; 6]>,
+    /// A row and the gray value of each of its pixels.
+    pub rows: Vec<(usize, Vec<u8>)>,
+}
+
+/// Rows y0..y1 shifted right by `shift` (wrapping), channels rotated by `perm` (0..=2).
+pub(crate) struct GlitchSlice {
+    pub y0: usize,
+    pub y1: usize,
+    pub shift: isize,
+    pub perm: usize,
+}
+
+/// Layout comes from `seed` so a glitch holds for a few frames; `jitter` adds flicker.
+fn glitch_plan(w: usize, h: usize, seed: u64, jitter: &mut Rng, amount: f32) -> GlitchPlan {
+    let mut g = Rng::new(seed);
+    let mut slices = Vec::new();
+    for _ in 0..3 + g.below(6) {
+        let y0 = g.below(h);
+        let height = 1 + g.below(h / 5 + 1);
+        let shift = ((g.signed() * 0.3 + jitter.signed() * 0.03) * w as f32 * amount) as isize;
+        // Mostly plain displacement; a channel swap only now and then.
+        let perm = if g.below(8) == 0 { 1 + g.below(2) } else { 0 };
+        slices.push(GlitchSlice {
+            y0,
+            y1: (y0 + height).min(h),
+            shift,
+            perm,
+        });
+    }
+    // Small displaced blocks: about 3-11% of the width and 2-9% of the height each.
+    let mut blocks = Vec::new();
+    for _ in 0..g.below(7) {
+        let bw = (w / 32).max(1) + g.below(w / 12 + 1);
+        let bh = (h / 48).max(1) + g.below(h / 14 + 1);
+        let (sx, sy) = (g.below(w), g.below(h));
+        let (dx, dy) = (g.below(w), g.below(h));
+        blocks.push([sx, sy, dx, dy, bw, bh]);
+    }
+    let thick = (w / 200).max(1);
+    let mut rows = Vec::new();
+    for _ in 0..g.below(3) * thick {
+        let y = jitter.below(h);
+        rows.push((y, (0..w).map(|_| jitter.below(256) as u8).collect()));
+    }
+    GlitchPlan {
+        slices,
+        blocks,
+        rows,
+    }
+}
+
+/// The CPU side of the effect chain: runs `Step`s on a frame in main memory, and keeps
+/// the history and scratch buffers they need.
+#[derive(Default)]
+struct Cpu {
+    tmp: Vec<u8>,
+    /// Trails: the previous output.
+    prev: Vec<u8>,
+    /// Tunnel feedback: the previous tunnel output.
+    feedback: Vec<u8>,
+    /// Echo: two progressively slower copies of the picture.
+    lag1: Vec<u8>,
+    lag2: Vec<u8>,
+    /// Glow's bright pass and the reduced-size blur, and edge detection's luminance.
+    scratch: Vec<u8>,
+    luma: Vec<u8>,
+    /// Running column sums for the blur's vertical pass.
+    sums: Vec<u32>,
+    /// Vignette strength per pixel (0..=256), cached per frame size.
+    vignette: Vec<u16>,
+    vignette_size: (usize, usize),
+    /// Dither thresholds: 16 Bayer steps x 256 input values, for `dither_levels` levels.
+    dither_lut: Vec<u8>,
+    dither_levels: u32,
+}
+
+impl Cpu {
+    fn free_unused(&mut self, enabled: &[bool; Fx::ALL.len()]) {
+        for (fx, buf) in [
+            (Fx::Trails, &mut self.prev),
+            (Fx::Tunnel, &mut self.feedback),
+            (Fx::Echo, &mut self.lag1),
+            (Fx::Echo, &mut self.lag2),
+            (Fx::Edges, &mut self.luma),
+        ] {
+            if !enabled[fx as usize] && buf.capacity() > 0 {
+                *buf = Vec::new();
             }
-        } else if let Some(lut) = tone {
-            apply_lut(out, &lut);
+        }
+    }
+
+    /// Drop the history (trails, tunnel, echo), so it starts over from the next frame.
+    fn forget(&mut self) {
+        self.prev.clear();
+        self.feedback.clear();
+        self.lag1.clear();
+        self.lag2.clear();
+    }
+
+    fn vignette_for(&mut self, w: usize, h: usize) {
+        if self.vignette_size != (w, h) {
+            self.vignette = vignette(w, h);
+            self.vignette_size = (w, h);
+        }
+    }
+
+    fn run(
+        &mut self,
+        src: &[u8],
+        w: usize,
+        h: usize,
+        steps: &[Step],
+        noise: &[i16],
+        out: &mut [u8],
+    ) {
+        let row = w * 3;
+        self.tmp.resize(out.len(), 0);
+        for step in steps {
+            match step {
+                Step::Warp(warp) => geometry(src, out, w, h, warp),
+                Step::Shift(offs) => {
+                    for (r, &off) in out.chunks_exact_mut(row).zip(offs) {
+                        shift_row(r, off as isize);
+                    }
+                }
+                Step::Tunnel { zoom, k } => {
+                    prime(&mut self.feedback, out);
+                    // No rotation: a plain zoom takes the fast resampling path.
+                    let fb = Warp {
+                        zoom: *zoom,
+                        ..Warp::default()
+                    };
+                    geometry(&self.feedback, &mut self.tmp, w, h, &fb);
+                    blend(out, &self.tmp, *k);
+                    self.feedback.copy_from_slice(out);
+                }
+                Step::Trails { k } => {
+                    prime(&mut self.prev, out);
+                    blend(out, &self.prev, *k);
+                    self.prev.copy_from_slice(out);
+                }
+                Step::Echo { k } => echo(out, &mut self.lag1, &mut self.lag2, *k),
+                Step::Blur { radius } => soft_blur(
+                    out,
+                    &mut self.scratch,
+                    &mut self.tmp,
+                    &mut self.sums,
+                    w,
+                    h,
+                    *radius,
+                ),
+                Step::Glow { radius, gain } => glow(
+                    out,
+                    &mut self.scratch,
+                    &mut self.tmp,
+                    &mut self.sums,
+                    w,
+                    h,
+                    *radius,
+                    *gain,
+                ),
+                Step::Split { off } => rgb_split(out, &mut self.tmp, w, h, *off),
+                Step::Grade { lut, mix, vignette } => {
+                    if *vignette {
+                        self.vignette_for(w, h);
+                        grade(out, lut, *mix, Some(&self.vignette));
+                    } else {
+                        grade(out, lut, *mix, None);
+                    }
+                }
+                Step::Hue(m) => hue_apply(out, m),
+                Step::Swap(perm) => swap(out, *perm),
+                Step::Glitch(plan) => glitch(out, &mut self.tmp, w, h, plan),
+                Step::Snow { a, rows } => snow(out, w, *a, noise, rows),
+                Step::Edges { gain } => edges(out, &mut self.luma, w, h, *gain),
+                Step::Pixel { block } => pixelate(out, w, h, *block),
+                Step::Dither { levels, cell } => {
+                    if self.dither_levels != *levels {
+                        self.dither_lut = dither_table(*levels);
+                        self.dither_levels = *levels;
+                    }
+                    dither(out, w, &self.dither_lut, *cell);
+                }
+                Step::Vhs { line, grain, rows } => vhs(out, w, *line, *grain, noise, rows),
+                Step::Crt { line, cell, boost } => crt(out, w, *line, *cell, *boost),
+                Step::Film(plan) => film(out, w, h, noise, plan),
+                Step::Darken { k } => {
+                    self.vignette_for(w, h);
+                    darken_edges(out, &self.vignette, *k);
+                }
+                Step::Cinema { bar } => {
+                    out[..bar * row].fill(0);
+                    out[(h - bar) * row..].fill(0);
+                }
+                Step::Tone(lut) => apply_lut(out, lut),
+            }
         }
     }
 }
 
 /// How `geometry` maps output pixels to source pixels.
 #[derive(Default)]
-struct Warp {
-    zoom: f32,
-    dx: f32,
-    dy: f32,
+pub(crate) struct Warp {
+    pub zoom: f32,
+    pub dx: f32,
+    pub dy: f32,
     /// Fold the right half onto the left (and the bottom onto the top).
-    mirror: bool,
-    mirror_y: bool,
+    pub mirror: bool,
+    pub mirror_y: bool,
     /// Rotation in radians.
-    angle: f32,
+    pub angle: f32,
     /// Fisheye strength, 0 = none.
-    bulge: f32,
+    pub bulge: f32,
+}
+
+impl Warp {
+    /// Whether it has the per-pixel path (rotation or fisheye) in `geometry`.
+    pub fn per_pixel(&self) -> bool {
+        self.angle.abs() > 1e-4 || self.bulge > 1e-4
+    }
+
+    /// Whether every output column is its own source column on the fast path.
+    pub fn identity_x(&self) -> bool {
+        !self.mirror && (self.zoom - 1.0).abs() < 1e-4 && self.dx.round() == 0.0
+    }
+
+    /// Whether `geometry` copies the frame unchanged.
+    fn is_identity(&self) -> bool {
+        self.zoom == 1.0
+            && self.dx == 0.0
+            && self.dy == 0.0
+            && !self.mirror
+            && !self.mirror_y
+            && !self.per_pixel()
+    }
 }
 
 fn geometry(src: &[u8], out: &mut [u8], w: usize, h: usize, warp: &Warp) {
@@ -876,7 +1286,7 @@ fn geometry(src: &[u8], out: &mut [u8], w: usize, h: usize, warp: &Warp) {
         }
     };
 
-    if warp.angle.abs() > 1e-4 || warp.bulge > 1e-4 {
+    if warp.per_pixel() {
         // Per-pixel path: every output pixel has its own source position. Everything
         // that depends only on the column is computed once per frame.
         let (sin, cos) = warp.angle.sin_cos();
@@ -912,7 +1322,7 @@ fn geometry(src: &[u8], out: &mut [u8], w: usize, h: usize, warp: &Warp) {
         return;
     }
 
-    let identity_x = !warp.mirror && (warp.zoom - 1.0).abs() < 1e-4 && warp.dx.round() == 0.0;
+    let identity_x = warp.identity_x();
     // Source column of every output column (in bytes), shared by all rows.
     let cols: Vec<usize> = if identity_x {
         Vec::new()
@@ -931,6 +1341,25 @@ fn geometry(src: &[u8], out: &mut [u8], w: usize, h: usize, warp: &Warp) {
                 o.copy_from_slice(&src_row[s..s + 3]);
             }
         }
+    }
+}
+
+/// lag1 follows the picture, lag2 follows lag1; green shows lag1, blue lag2.
+fn echo(out: &mut [u8], lag1: &mut Vec<u8>, lag2: &mut Vec<u8>, k: u32) {
+    prime(lag1, out);
+    prime(lag2, out);
+    let lerp = |a: u8, b: u8| ((a as u32 * k + b as u32 * (256 - k)) >> 8) as u8;
+    for ((o, a), b) in out.iter().zip(lag1.iter_mut()).zip(lag2.iter_mut()) {
+        *a = lerp(*a, *o);
+        *b = lerp(*b, *a);
+    }
+    for ((o, a), b) in out
+        .chunks_exact_mut(3)
+        .zip(lag1.chunks_exact(3))
+        .zip(lag2.chunks_exact(3))
+    {
+        o[1] = a[1];
+        o[2] = b[2];
     }
 }
 
@@ -1053,20 +1482,6 @@ fn vignette(w: usize, h: usize) -> Vec<u16> {
         .collect()
 }
 
-fn red_grade(out: &mut [u8], vignette: &[u16], lut: &[[u8; 3]; 256], amount: f32) {
-    let mix = (amount * 256.0) as u32;
-    let keep = 256 - mix;
-    // The table side of the mix, premultiplied.
-    let pre: [[u16; 3]; 256] = std::array::from_fn(|l| lut[l].map(|t| (t as u32 * mix) as u16));
-    for (px, &v) in out.chunks_exact_mut(3).zip(vignette) {
-        let t = pre[luma(px) as usize];
-        for c in 0..3 {
-            let graded = (px[c] as u32 * keep + t[c] as u32) >> 8;
-            px[c] = ((graded * v as u32) >> 8) as u8;
-        }
-    }
-}
-
 /// A luminance -> colour table from (position 0..1, colour) stops, in order.
 fn gradient_lut(stops: &[(f32, [u8; 3])]) -> [[u8; 3]; 256] {
     std::array::from_fn(|i| {
@@ -1082,8 +1497,9 @@ fn gradient_lut(stops: &[(f32, [u8; 3])]) -> [[u8; 3]; 256] {
     })
 }
 
-/// Rotate hue by `angle` radians: a rotation around the gray axis in RGB space.
-fn hue_rotate(out: &mut [u8], angle: f32) {
+/// Rotation of hue by `angle` radians (a rotation around the gray axis in RGB space), as
+/// a fixed-point matrix (1.0 = 256).
+fn hue_matrix(angle: f32) -> [[i32; 3]; 3] {
     let (s, c) = angle.sin_cos();
     let (a, b) = ((1.0 - c) / 3.0, (1.0f32 / 3.0).sqrt() * s);
     let m = [
@@ -1091,11 +1507,13 @@ fn hue_rotate(out: &mut [u8], angle: f32) {
         [a + b, c + a, a - b],
         [a - b, a + b, c + a],
     ];
-    // Fixed point, 1.0 = 256.
-    let m: [[i32; 3]; 3] = m.map(|r| r.map(|v| (v * 256.0) as i32));
+    m.map(|r| r.map(|v| (v * 256.0) as i32))
+}
+
+fn hue_apply(out: &mut [u8], m: &[[i32; 3]; 3]) {
     for px in out.chunks_exact_mut(3) {
         let (r, g, bl) = (px[0] as i32, px[1] as i32, px[2] as i32);
-        for (o, k) in px.iter_mut().zip(&m) {
+        for (o, k) in px.iter_mut().zip(m) {
             *o = ((r * k[0] + g * k[1] + bl * k[2]) >> 8).clamp(0, 255) as u8;
         }
     }
@@ -1148,7 +1566,7 @@ fn soft_blur(
 
 /// Downscale factor for blurring with `radius`: a power of two, 1 to 8, leaving a radius
 /// of at least 2 pixels at the reduced size.
-fn blur_scale(radius: usize) -> usize {
+pub(crate) fn blur_scale(radius: usize) -> usize {
     let f = (radius / 2).max(1);
     (1usize << f.ilog2()).min(8)
 }
@@ -1233,11 +1651,10 @@ fn upsample(
 }
 
 /// TV snow mixed over the picture.
-fn snow(out: &mut [u8], w: usize, amount: f32, noise: &[i16], rng: &mut Rng) {
-    let a = (amount.clamp(0.0, 1.0) * 256.0) as i32;
+fn snow(out: &mut [u8], w: usize, a: i32, noise: &[i16], rows: &[u32]) {
     let keep = 256 - a;
-    for row in out.chunks_exact_mut(w * 3) {
-        for (px, &n) in row.chunks_exact_mut(3).zip(noise_row(noise, w, rng)) {
+    for (row, &start) in out.chunks_exact_mut(w * 3).zip(rows) {
+        for (px, &n) in row.chunks_exact_mut(3).zip(noise_row(noise, w, start)) {
             let snow = ((n as i32 + 256) >> 1) * a;
             for v in px {
                 *v = ((*v as i32 * keep + snow) >> 8) as u8;
@@ -1248,10 +1665,9 @@ fn snow(out: &mut [u8], w: usize, amount: f32, noise: &[i16], rng: &mut Rng) {
 
 /// Neon outlines: Sobel edge strength lights up the picture's own colours, the rest goes
 /// dark.
-fn edges(out: &mut [u8], luma_buf: &mut Vec<u8>, w: usize, h: usize, gain: f32) {
+fn edges(out: &mut [u8], luma_buf: &mut Vec<u8>, w: usize, h: usize, g: i32) {
     luma_buf.clear();
     luma_buf.extend(out.chunks_exact(3).map(|px| luma(px) as u8));
-    let g = (gain * 256.0) as i32;
     // Edge strength (0..=256) from the 3x3 neighbourhood: columns a, b, c of rows up,
     // mid, down.
     let strength = |up: [u8; 3], mid: [u8; 3], dn: [u8; 3]| -> i32 {
@@ -1340,10 +1756,7 @@ fn dither_table(levels: u32) -> Vec<u8> {
 }
 
 /// Scanlines and an RGB phosphor mask; hits brighten the tube.
-fn crt(out: &mut [u8], w: usize, px: f32, p: f32) {
-    let line = (px * 0.5).round().max(1.0) as usize;
-    let cell = (px * 0.34).round().max(1.0) as usize;
-    let boost = (256.0 * (1.15 + 0.35 * p)) as u32;
+fn crt(out: &mut [u8], w: usize, line: usize, cell: usize, boost: u32) {
     // Gain of every byte in a row (phosphor mask x brightness), for lit and dark lines.
     let gains = |scan: u32| -> Vec<u16> {
         let k = (scan * boost) >> 8;
@@ -1367,50 +1780,32 @@ fn crt(out: &mut [u8], w: usize, px: f32, p: f32) {
     }
 }
 
-/// Old film: sepia, flicker, grain, and now and then a scratch or a dust speck.
-#[allow(clippy::too_many_arguments)]
-fn film(
-    out: &mut [u8],
-    w: usize,
-    h: usize,
-    sepia: &[[u8; 3]; 256],
-    noise: &[i16],
-    rng: &mut Rng,
-    p: f32,
-    intensity: f32,
-) {
-    let flicker = 1.0 + rng.signed() * 0.05 + 0.15 * p;
-    let mix = ((0.85 * intensity).min(1.0) * 256.0) as i32;
-    let keep = 256 - mix;
-    // Sepia with this frame's flicker, premultiplied by the mix.
-    let lut: [[i32; 3]; 256] = std::array::from_fn(|v| {
-        sepia[((v as f32 * flicker) as usize).min(255)].map(|t| t as i32 * mix)
-    });
-    let grain = (18.0 * intensity) as i32;
+/// Old film: sepia, flicker, grain, scratches and dust (see `FilmPlan`).
+fn film(out: &mut [u8], w: usize, h: usize, noise: &[i16], f: &FilmPlan) {
+    let keep = 256 - f.mix;
+    // The sepia side of the mix, premultiplied.
+    let lut: [[i32; 3]; 256] = std::array::from_fn(|v| f.lut[v].map(|t| t as i32 * f.mix));
     // Grade and grain in one pass.
-    for row in out.chunks_exact_mut(w * 3) {
-        for (px, &n) in row.chunks_exact_mut(3).zip(noise_row(noise, w, rng)) {
+    for (row, &start) in out.chunks_exact_mut(w * 3).zip(&f.rows) {
+        for (px, &n) in row.chunks_exact_mut(3).zip(noise_row(noise, w, start)) {
             let t = lut[luma(px) as usize];
-            let n = (n as i32 * grain) >> 8;
+            let n = (n as i32 * f.grain) >> 8;
             for c in 0..3 {
                 px[c] = (((px[c] as i32 * keep + t[c]) >> 8) + n).clamp(0, 255) as u8;
             }
         }
     }
     // Scratches: thin bright vertical lines.
-    for _ in 0..rng.below(3) {
-        let x = rng.below(w);
+    for &x in &f.scratches {
         for y in 0..h {
             let o = (y * w + x) * 3;
             out[o..o + 3].copy_from_slice(&[230, 220, 200]);
         }
     }
     // Dust: a few dark specks.
-    let size = (w / 160).max(1);
-    for _ in 0..rng.below(4) {
-        let (x0, y0) = (rng.below(w), rng.below(h));
-        for y in y0..(y0 + size).min(h) {
-            for x in x0..(x0 + size).min(w) {
+    for &(x0, y0) in &f.dust {
+        for y in y0..(y0 + f.size).min(h) {
+            for x in x0..(x0 + f.size).min(w) {
                 let o = (y * w + x) * 3;
                 out[o..o + 3].copy_from_slice(&[15, 10, 5]);
             }
@@ -1418,9 +1813,8 @@ fn film(
     }
 }
 
-/// Darken towards the edges by `k` (1 = the vignette table as is, more = darker).
-fn darken_edges(out: &mut [u8], vignette: &[u16], k: f32) {
-    let k = (k * 256.0) as u32;
+/// Darken towards the edges by `k` (256 = the vignette table as is, more = darker).
+fn darken_edges(out: &mut [u8], vignette: &[u16], k: u32) {
     for (px, &v) in out.chunks_exact_mut(3).zip(vignette) {
         let dark = (((256 - v as u32) * k) >> 8).min(256);
         let f = 256 - dark;
@@ -1430,48 +1824,26 @@ fn darken_edges(out: &mut [u8], vignette: &[u16], k: f32) {
     }
 }
 
-/// Datamosh-ish corruption: displaced slices with swapped channels, moved blocks, noise rows.
-/// Layout comes from `seed` so a glitch holds for a few frames; `jitter` adds flicker.
-fn glitch(
-    out: &mut [u8],
-    tmp: &mut [u8],
-    w: usize,
-    h: usize,
-    seed: u64,
-    jitter: &mut Rng,
-    amount: f32,
-) {
+/// Datamosh-ish corruption, laid out by `glitch_plan`.
+fn glitch(out: &mut [u8], tmp: &mut [u8], w: usize, h: usize, plan: &GlitchPlan) {
     tmp.copy_from_slice(out);
-    let mut g = Rng::new(seed);
-
-    for _ in 0..3 + g.below(6) {
-        let y0 = g.below(h);
-        let height = 1 + g.below(h / 5 + 1);
-        let shift = ((g.signed() * 0.3 + jitter.signed() * 0.03) * w as f32 * amount) as isize;
-        // Mostly plain displacement; a channel swap only now and then.
-        let perm = if g.below(8) == 0 { 1 + g.below(2) } else { 0 };
-        for y in y0..(y0 + height).min(h) {
+    for s in &plan.slices {
+        for y in s.y0..s.y1 {
             for x in 0..w {
-                let sx = (x as isize - shift).rem_euclid(w as isize) as usize;
-                let s = (y * w + sx) * 3;
-                let (r, gg, b) = (tmp[s], tmp[s + 1], tmp[s + 2]);
-                let px = match perm {
-                    0 => [r, gg, b],
-                    1 => [gg, b, r],
-                    _ => [b, r, gg],
+                let sx = (x as isize - s.shift).rem_euclid(w as isize) as usize;
+                let i = (y * w + sx) * 3;
+                let (r, g, b) = (tmp[i], tmp[i + 1], tmp[i + 2]);
+                let px = match s.perm {
+                    0 => [r, g, b],
+                    1 => [g, b, r],
+                    _ => [b, r, g],
                 };
                 let o = (y * w + x) * 3;
                 out[o..o + 3].copy_from_slice(&px);
             }
         }
     }
-
-    // Small displaced blocks: about 3-11% of the width and 2-9% of the height each.
-    for _ in 0..g.below(7) {
-        let bw = (w / 32).max(1) + g.below(w / 12 + 1);
-        let bh = (h / 48).max(1) + g.below(h / 14 + 1);
-        let (sx, sy) = (g.below(w), g.below(h));
-        let (dx, dy) = (g.below(w), g.below(h));
+    for &[sx, sy, dx, dy, bw, bh] in &plan.blocks {
         for yy in 0..bh {
             for xx in 0..bw {
                 let (x0, y0, x1, y1) = (sx + xx, sy + yy, dx + xx, dy + yy);
@@ -1483,12 +1855,8 @@ fn glitch(
             }
         }
     }
-
-    let thick = (w / 200).max(1);
-    for _ in 0..g.below(3) * thick {
-        let y = jitter.below(h);
-        for x in 0..w {
-            let v = jitter.below(256) as u8;
+    for (y, values) in &plan.rows {
+        for (x, &v) in values.iter().enumerate() {
             let o = (y * w + x) * 3;
             out[o..o + 3].copy_from_slice(&[v, v, v]);
         }
@@ -1515,38 +1883,13 @@ fn pixelate(out: &mut [u8], w: usize, h: usize, block: usize) {
     }
 }
 
-/// Tape look: wobbling rows, a rolling tracking band, scanlines and grain.
-#[allow(clippy::too_many_arguments)]
-fn vhs(
-    out: &mut [u8],
-    w: usize,
-    h: usize,
-    time: f32,
-    p: f32,
-    intensity: f32,
-    px: f32,
-    noise: &[i16],
-    rng: &mut Rng,
-) {
-    let band = ((time * 0.23).fract() * h as f32) as isize;
-    let band_half = (3.0 * px) as isize;
-    let line = (px * 0.5).round().max(1.0) as usize;
-    // Grain amplitude in 1/256 steps (noise values are -256..256).
-    let grain = (10.0 * intensity) as i32;
-    let row = w * 3;
-    for (y, dst) in out.chunks_exact_mut(row).enumerate().take(h) {
-        let mut off = (time * 9.0 + y as f32 * 0.21 / px).sin() * (0.4 + 1.5 * p) * px;
-        let in_band = (y as isize - band).abs() < band_half;
-        if in_band {
-            off += rng.signed() * 6.0 * intensity * px;
-        }
-        shift_row(dst, off.round() as isize);
-
+/// Tape look: wobbling rows, a rolling tracking band, scanlines and grain (see `VhsRow`).
+fn vhs(out: &mut [u8], w: usize, line: usize, grain: i32, noise: &[i16], rows: &[VhsRow]) {
+    for (y, (dst, r)) in out.chunks_exact_mut(w * 3).zip(rows).enumerate() {
+        shift_row(dst, r.off as isize);
         let scan: i32 = if (y / line) % 2 == 1 { 210 } else { 256 };
-        let lift: i32 = if in_band { 25 } else { 0 };
-        // A random window into the grain table for this row.
-        for (pxl, &n) in dst.chunks_exact_mut(3).zip(noise_row(noise, w, rng)) {
-            let n = n as i32 * grain / 256 + lift;
+        for (pxl, &n) in dst.chunks_exact_mut(3).zip(noise_row(noise, w, r.start)) {
+            let n = n as i32 * grain / 256 + r.lift;
             for v in pxl {
                 *v = (((*v as i32 * scan) >> 8) + n).clamp(0, 255) as u8;
             }
@@ -1801,10 +2144,10 @@ mod tests {
     #[test]
     fn hue_rotation_keeps_gray_and_wraps() {
         let mut gray = vec![100, 100, 100];
-        hue_rotate(&mut gray, 1.3);
+        hue_apply(&mut gray, &hue_matrix(1.3));
         assert!(gray.iter().all(|&v| v.abs_diff(100) <= 2));
         let mut red = vec![200, 10, 10];
-        hue_rotate(&mut red, std::f32::consts::TAU);
+        hue_apply(&mut red, &hue_matrix(std::f32::consts::TAU));
         assert!(red[0] >= 195 && red[1] <= 15);
     }
 
@@ -1864,6 +2207,74 @@ mod tests {
         assert_eq!(content_rect(&vec![0; w * h * 3], w, h), (0, 0, w, h));
         let full = vec![200; w * h * 3];
         assert_eq!(content_rect(&full, w, h), (0, 0, w, h));
+    }
+
+    /// The GPU runs every effect like the CPU does. Skipped when there is no GPU.
+    #[test]
+    fn gpu_matches_cpu() {
+        let clean = PRESETS.iter().find(|p| p.fx.is_empty()).unwrap();
+        let mut slot = GpuSlot::default();
+        slot.start_blocking();
+        if slot.get().is_none() {
+            eprintln!("skipped: {}", slot.status());
+            return;
+        }
+        let sets: Vec<Vec<Fx>> = std::iter::once(Fx::ALL.to_vec())
+            .chain(Fx::ALL.iter().map(|&f| vec![f]))
+            .collect();
+        let mut report = Vec::new();
+        for &(w, h) in &[(1, 1), (3, 2), (17, 5), (101, 57), (640, 360)] {
+            let src: Vec<u8> = (0..w * h * 3)
+                .map(|i| ((i * 37) ^ (i / 7) ^ (i / (w * 3) * 11)) as u8)
+                .collect();
+            for set in &sets {
+                let name = if set.len() > 1 { "all" } else { set[0].label() };
+                let mut cpu = Effects::new(clean);
+                let mut gpu = Effects::new(clean);
+                for fx in [&mut cpu, &mut gpu] {
+                    fx.set_enabled(set);
+                    fx.intensity = 1.3;
+                }
+                gpu.gpu = std::mem::take(&mut slot);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let (mut differ, mut worst) = (0usize, 0u8);
+                for k in 0..8 {
+                    let d = Drive {
+                        pulse: (k % 4) as f32 * 0.4,
+                        level: 0.7,
+                        beat: k % 3 == 0,
+                        strength: 0.9,
+                    };
+                    cpu.render(&src, w, h, d, 1.0 / 30.0, &mut a);
+                    gpu.render(&src, w, h, d, 1.0 / 30.0, &mut b);
+                    assert_eq!(a.len(), b.len());
+                    for (x, y) in a.iter().zip(&b) {
+                        if x != y {
+                            differ += 1;
+                            worst = worst.max(x.abs_diff(*y));
+                        }
+                    }
+                }
+                slot = std::mem::take(&mut gpu.gpu);
+                assert!(slot.get().is_some(), "{name} {w}x{h}: {}", slot.status());
+                slot.forget();
+                let share = differ as f64 / (a.len() * 8) as f64;
+                if differ > 0 {
+                    report.push(format!(
+                        "{name} {w}x{h}: {:.3}% differ, by up to {worst}",
+                        share * 100.0
+                    ));
+                }
+                // Floats (resampling positions) may round differently on the GPU now
+                // and then; everything else is integer maths and matches exactly.
+                assert!(
+                    share < 0.01,
+                    "{name} {w}x{h}: {:.2}% of bytes differ",
+                    share * 100.0
+                );
+            }
+        }
+        eprintln!("{}", report.join("\n"));
     }
 
     #[test]
@@ -2003,6 +2414,51 @@ mod bench {
                 t.elapsed().as_secs_f64() * 1000.0 / n as f64,
                 Fx::ALL.len()
             );
+        }
+    }
+
+    /// `cargo test --release bench_gpu -- --ignored --nocapture`: all effects and the
+    /// presets, on the CPU and on the GPU.
+    #[test]
+    #[ignore]
+    fn bench_gpu() {
+        let mut slot = GpuSlot::default();
+        slot.start_blocking();
+        println!("{}", slot.status());
+        let all = Preset {
+            name: "all",
+            fx: &Fx::ALL,
+        };
+        for &(w, h) in &[(200, 112), (854, 480), (1280, 720), (1920, 1080)] {
+            let src: Vec<u8> = (0..w * h * 3).map(|i| (i * 37 % 256) as u8).collect();
+            let mut line = format!("{w}x{h} ms/frame cpu / gpu:");
+            for preset in std::iter::once(&all).chain(PRESETS) {
+                let mut ms = [0.0; 2];
+                for (k, on_gpu) in [false, true].into_iter().enumerate() {
+                    let mut fx = Effects::new(preset);
+                    if on_gpu {
+                        fx.gpu = std::mem::take(&mut slot);
+                    }
+                    let mut out = Vec::new();
+                    let n = 30;
+                    let t = Instant::now();
+                    for f in 0..n {
+                        let d = Drive {
+                            pulse: if f % 8 == 0 { 0.9 } else { 0.3 },
+                            level: 0.6,
+                            beat: f % 8 == 0,
+                            strength: 0.8,
+                        };
+                        fx.render(&src, w, h, d, 1.0 / 30.0, &mut out);
+                    }
+                    ms[k] = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+                    if on_gpu {
+                        slot = std::mem::take(&mut fx.gpu);
+                    }
+                }
+                line += &format!("  {} {:.2}/{:.2}", preset.name, ms[0], ms[1]);
+            }
+            println!("{line}");
         }
     }
 

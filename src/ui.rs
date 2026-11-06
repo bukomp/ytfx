@@ -378,6 +378,20 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect, border: Style) {
             "   ←→ ±10 ms   shift ←→ ±50 ms   0 no delay   t test   in the player: , . ±10 ms",
             Style::new().fg(DIM),
         ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("   effects  ", Style::new().fg(Color::White).bold()),
+            Span::styled(app.effects.backend(), Style::new().fg(Color::Gray)),
+            Span::styled("   video decoding  ", Style::new().fg(Color::White).bold()),
+            Span::styled(
+                if crate::player::HW_DECODE.load(std::sync::atomic::Ordering::Relaxed) {
+                    "gpu when ffmpeg can (-hwaccel auto)"
+                } else {
+                    "cpu (--no-hwdec)"
+                },
+                Style::new().fg(Color::Gray),
+            ),
+        ]),
     ];
     let text_h = lines.len() as u16;
     f.render_widget(Paragraph::new(lines), inner);
@@ -1441,6 +1455,10 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
                 Renderer::Blocks => format!("{}×{} blocks ", app.frame_dims.0, app.frame_dims.1),
             },
             Style::new().fg(Color::Gray),
+        ),
+        Span::styled(
+            if app.effects.on_gpu() { "gpu " } else { "cpu " },
+            Style::new().fg(DIM),
         ),
     ];
     // Names of the effects that are on, as many as fit before the menu button.
