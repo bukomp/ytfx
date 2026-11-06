@@ -6,11 +6,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph, Widget};
 
 use crate::account::BROWSERS;
+use crate::analysis::{Analyzer, Band, SENS_MAX, SLICE_HZ, SLICES, slice_hz};
 use crate::effects::{Fx, PRESETS};
 use crate::preview::{self, Slot};
 use crate::textinput::TextInput;
 use crate::youtube::{Entry, Kind};
-use crate::{AccountUi, App, Focus, RES_STEPS, Renderer, Tab};
+use crate::{AccountUi, App, Focus, FxPage, RES_STEPS, Renderer, Tab};
 use ratatui::layout::Position;
 
 pub const HUD_HEIGHT: u16 = 2;
@@ -23,15 +24,31 @@ const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '
 const PREVIEW_MIN_WIDTH: u16 = 90;
 
 /// Width of the effects side menu.
-const FX_MENU_WIDTH: u16 = 30;
+const FX_MENU_WIDTH: u16 = 34;
 
 /// The part of the screen the video may use: everything above the HUD, left of the
-/// effects menu when it is open.
-pub fn video_area(area: Rect, fx_menu: bool) -> Rect {
-    let menu = if fx_menu { fx_menu_area(area).width } else { 0 };
-    Rect {
+/// effects menu or above the frequency panel when one is open.
+pub fn video_area(area: Rect, menu: Option<FxPage>) -> Rect {
+    let mut video = Rect {
         height: area.height.saturating_sub(HUD_HEIGHT),
-        width: area.width - menu,
+        ..area
+    };
+    match menu {
+        Some(FxPage::Effects) => video.width -= fx_menu_area(area).width,
+        Some(FxPage::Freq) => video.height -= freq_panel_area(area).height,
+        None => {}
+    }
+    video
+}
+
+/// Where the frequency panel goes: the full width, right above the HUD. About half the
+/// screen, so the columns are tall, but the video keeps a few rows.
+fn freq_panel_area(area: Rect) -> Rect {
+    let room = area.height.saturating_sub(HUD_HEIGHT);
+    let height = (room / 2).clamp(14, 30).min(room.saturating_sub(4));
+    Rect {
+        y: area.y + room - height,
+        height,
         ..area
     }
 }
@@ -90,6 +107,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.fx_button = None;
     app.fx_menu_rect = None;
     app.fx_rows.clear();
+    app.fx_tabs.clear();
+    app.freq_geom = None;
     // Until the first frame arrives the browser stays up, with the spinner over it.
     let loading = app
         .player
@@ -206,18 +225,19 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
     }
 
     let border = Style::new().fg(if search_focused { DIM } else { ACCENT });
-    let (list, pane) = if app.show_preview && list.width >= PREVIEW_MIN_WIDTH {
-        let width = (list.width * 2 / 5).clamp(36, 72);
-        let [list, pane] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(width)]).areas(list);
-        (list, Some(pane))
-    } else {
-        (list, None)
-    };
-    if app.tab == Tab::Queue {
-        draw_queue(f, app, list, border);
-    } else {
-        draw_list(f, app, list, border);
+    let (list, pane) =
+        if app.show_preview && list.width >= PREVIEW_MIN_WIDTH && app.tab != Tab::Settings {
+            let width = (list.width * 2 / 5).clamp(36, 72);
+            let [list, pane] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(width)]).areas(list);
+            (list, Some(pane))
+        } else {
+            (list, None)
+        };
+    match app.tab {
+        Tab::Queue => draw_queue(f, app, list, border),
+        Tab::Settings => draw_settings(f, app, list, border),
+        _ => draw_list(f, app, list, border),
     }
     if let Some(pane) = pane {
         draw_preview(f, app, pane);
@@ -238,7 +258,15 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             ("x", "remove"),
             ("R", "radio"),
             ("S", "shuffle"),
-            ("1-6", "tabs"),
+            ("1-7", "tabs"),
+            ("?", "help"),
+        ]),
+        None if app.tab == Tab::Settings => hints(&[
+            ("←→", "delay ±10 ms"),
+            ("shift", "±50 ms"),
+            ("0", "no delay"),
+            ("t", "sync test"),
+            ("1-7", "tabs"),
             ("?", "help"),
         ]),
         None if app.tab == Tab::History => hints(&[
@@ -247,7 +275,7 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             ("r", "radio"),
             ("a", "queue"),
             ("S", "shuffle all"),
-            ("1-6", "tabs"),
+            ("1-7", "tabs"),
             ("?", "help"),
         ]),
         None => hints(&[
@@ -255,12 +283,151 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             ("r", "radio"),
             ("a", "queue"),
             ("S", "shuffle all"),
-            ("1-6", "tabs"),
+            ("1-7", "tabs"),
             ("L", "account"),
             ("?", "help"),
         ]),
     };
     f.render_widget(Paragraph::new(footer_line), footer);
+}
+
+/// The settings tab: the audio output delay, a sync test (clicks and a flash) and a
+/// beat light to set it by.
+fn draw_settings(f: &mut Frame, app: &mut App, area: Rect, border: Style) {
+    let block = rounded().title(" settings ").border_style(border);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let ms = app.audio_delay_ms;
+    let max = crate::audio::MAX_DELAY_MS;
+    let bar_w = inner.width.saturating_sub(8).min(50) as u32;
+    let knob = (ms * bar_w.saturating_sub(1)).checked_div(max).unwrap_or(0);
+    let bar: String = (0..bar_w)
+        .map(|j| match j.cmp(&knob) {
+            std::cmp::Ordering::Less => '━',
+            std::cmp::Ordering::Equal => '●',
+            std::cmp::Ordering::Greater => '─',
+        })
+        .collect();
+    let (fill, rest) = bar.split_at(bar.char_indices().nth(knob as usize).map_or(0, |c| c.0));
+    let testing = app.audio.shared.test_on();
+    let light = if testing {
+        Line::styled(
+            "   t / enter: stop the test (leaving this tab stops it too)",
+            Style::new().fg(DIM),
+        )
+    } else if app.player.is_some() {
+        let glow = app.heard_pulse.clamp(0.0, 1.0);
+        let lit = |c: u8, a: u8| (f32::from(c) + (f32::from(a) - f32::from(c)) * glow) as u8;
+        Line::from(vec![
+            Span::styled("   beat light  ", Style::new().fg(Color::Gray)),
+            Span::styled(
+                "        ",
+                Style::new().bg(Color::Rgb(lit(30, 255), lit(10, 40), lit(16, 60))),
+            ),
+            Span::styled(
+                "  or set the delay until it flashes with each kick you hear",
+                Style::new().fg(DIM),
+            ),
+        ])
+    } else {
+        Line::styled(
+            "   while a video plays, a beat light shows here too",
+            Style::new().fg(DIM),
+        )
+    };
+    let lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" › audio delay  ", Style::new().fg(Color::White).bold()),
+            Span::styled(format!("{ms} ms"), Style::new().fg(ACCENT).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(fill.to_string(), Style::new().fg(ACCENT)),
+            Span::styled(rest.to_string(), Style::new().fg(DIM)),
+            Span::styled(format!(" {max} ms"), Style::new().fg(DIM)),
+        ]),
+        Line::raw(""),
+        Line::styled(
+            "   Holds back the video and the effects so they line up with what you hear.",
+            Style::new().fg(Color::Gray),
+        ),
+        Line::styled(
+            "   Bluetooth headphones usually need about 150-300 ms; wired output needs none.",
+            Style::new().fg(Color::Gray),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("   sync test  ", Style::new().fg(Color::White).bold()),
+            Span::styled(
+                if testing {
+                    "on: a click every 0.6 s (every 4th higher) and a flash"
+                } else {
+                    "t / enter: play clicks and show a flash for each"
+                },
+                Style::new().fg(if testing { ACCENT } else { Color::Gray }),
+            ),
+        ]),
+        Line::styled(
+            "   set the delay until each flash comes with its click, the big ones with the high clicks",
+            Style::new().fg(DIM),
+        ),
+        light,
+        Line::raw(""),
+        Line::styled(
+            "   ←→ ±10 ms   shift ←→ ±50 ms   0 no delay   t test   in the player: , . ±10 ms",
+            Style::new().fg(DIM),
+        ),
+    ];
+    let text_h = lines.len() as u16;
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // The flash, under the text, timed by the clicks that have been heard.
+    let room = Rect {
+        y: inner.y + text_h + 1,
+        height: inner.height.saturating_sub(text_h + 1),
+        ..inner
+    };
+    if let Some(heard) = app.audio.shared.heard_test_frames().filter(|_| testing)
+        && room.height >= 2
+    {
+        let (beat, since) = crate::audio::metronome_beat(heard, app.audio.rate);
+        let accent = beat.is_multiple_of(crate::audio::ACCENT_EVERY);
+        draw_sync_flash(f, room, accent, since, beat);
+    }
+}
+
+/// The sync test's flash: a block that lights at each heard click and fades in 0.15 s.
+/// Accented clicks get a wider, brighter block.
+fn draw_sync_flash(f: &mut Frame, room: Rect, accent: bool, since: f64, beat: u64) {
+    const FADE: f64 = 0.15;
+    let glow = (1.0 - since / FADE).clamp(0.0, 1.0) as f32;
+    let lit = |c: u8, a: u8| (f32::from(c) + (f32::from(a) - f32::from(c)) * glow) as u8;
+    let color = if accent {
+        Color::Rgb(lit(25, 255), lit(25, 255), lit(30, 255))
+    } else {
+        Color::Rgb(lit(25, 255), lit(10, 40), lit(14, 60))
+    };
+    let (w, h) = if accent { (40, 7) } else { (24, 5) };
+    let rect = Rect {
+        x: room.x + 3,
+        width: w.min(room.width.saturating_sub(3)),
+        height: h.min(room.height - 1),
+        ..room
+    };
+    f.render_widget(Block::new().style(Style::new().bg(color)), rect);
+    let n = crate::audio::ACCENT_EVERY;
+    let count: String = (0..n)
+        .map(|i| if i == beat % n { "● " } else { "○ " })
+        .collect();
+    f.render_widget(
+        Paragraph::new(format!("   {count}")).fg(Color::Gray),
+        Rect {
+            y: rect.bottom(),
+            height: 1,
+            ..room
+        },
+    );
 }
 
 fn draw_list(f: &mut Frame, app: &mut App, area: Rect, border: Style) {
@@ -599,7 +766,7 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
 
-    let video = video_area(area, app.fx_menu);
+    let video = video_area(area, app.open_menu());
     let (fw, fh) = app.frame_dims;
     let have_frame = fw > 0 && app.frame_out.len() >= fw * fh * 3;
     if have_frame && app.renderer == Renderer::Kitty {
@@ -643,8 +810,10 @@ fn draw_player(f: &mut Frame, app: &mut App) {
         );
     }
 
-    if app.fx_menu {
-        draw_fx_menu(f, app, fx_menu_area(area));
+    match app.open_menu() {
+        Some(FxPage::Effects) => draw_fx_menu(f, app, fx_menu_area(area)),
+        Some(FxPage::Freq) => draw_freq_panel(f, app, freq_panel_area(area)),
+        None => {}
     }
 
     if app.show_hud && area.height > HUD_HEIGHT {
@@ -681,12 +850,15 @@ fn draw_fx_menu(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
     app.fx_menu_rect = Some(inner);
 
-    let [head, list, foot] = Layout::vertical([
+    let [tabs, head, list, foot] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Min(1),
         Constraint::Length(3),
     ])
     .areas(inner);
+
+    draw_page_tabs(f, app, tabs);
 
     f.render_widget(
         Paragraph::new(vec![
@@ -700,7 +872,7 @@ fn draw_fx_menu(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::new().fg(DIM),
                 ),
             ]),
-            Line::styled(" p/P preset  [ ] amount", Style::new().fg(DIM)),
+            Line::styled(" p/P preset  [ ] amt  tab page", Style::new().fg(DIM)),
         ]),
         head,
     );
@@ -797,7 +969,15 @@ fn draw_fx_menu(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
-    let about = Fx::ALL[cursor].about();
+    draw_menu_foot(
+        f,
+        foot,
+        Fx::ALL[cursor].about(),
+        " spc toggle  c clear  e/esc",
+    );
+}
+
+fn draw_menu_foot(f: &mut Frame, foot: Rect, about: &str, keys: &str) {
     f.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -805,10 +985,377 @@ fn draw_fx_menu(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(Color::Rgb(70, 20, 30)),
             ),
             Line::styled(format!(" {about}"), Style::new().fg(Color::Gray)),
-            Line::styled(" spc toggle  c clear  e/esc", Style::new().fg(DIM)),
+            Line::styled(keys.to_string(), Style::new().fg(DIM)),
         ]),
         foot,
     );
+}
+
+/// The menu's page tabs on one row, clickable.
+fn draw_page_tabs(f: &mut Frame, app: &mut App, row: Rect) {
+    let mut spans = vec![Span::raw(" ")];
+    let mut x = row.x + 1;
+    for (page, name) in [
+        (FxPage::Effects, " effects "),
+        (FxPage::Freq, " frequencies "),
+    ] {
+        let width = name.chars().count() as u16;
+        app.fx_tabs.push((
+            Rect {
+                x,
+                width,
+                height: 1,
+                ..row
+            },
+            page,
+        ));
+        x += width + 1;
+        spans.push(Span::styled(
+            name,
+            if app.fx_page == page {
+                Style::new().fg(Color::Black).bg(ACCENT).bold()
+            } else {
+                Style::new().fg(Color::Gray)
+            },
+        ));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(
+        Line::from(spans),
+        Rect {
+            width: (x - row.x).min(row.width),
+            height: 1,
+            ..row
+        },
+    );
+}
+
+/// Rows of the sensitivity strip: 0, 0.5, 1.0, 1.5 and 2.0 each get a row to click.
+const SENS_ROWS: u16 = 5;
+
+/// Where the frequency panel's parts are, for drawing and for mouse clicks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreqGeom {
+    /// The live level columns, one per slice.
+    pub levels: Rect,
+    /// The sensitivity bars, one per slice, under the levels.
+    pub sens: Rect,
+    /// The slice in the leftmost column.
+    pub first: usize,
+}
+
+impl FreqGeom {
+    /// Lay out the panel's inside, scrolled so `cursor` shows. `scroll` is the
+    /// previous first column. None when there is no room.
+    fn new(inner: Rect, cursor: usize, scroll: usize) -> Option<FreqGeom> {
+        // Header, levels, axis, sensitivity, info.
+        let levels_h = inner
+            .height
+            .checked_sub(3 + SENS_ROWS)
+            .filter(|&h| h >= 2)?;
+        let cols = inner.width.checked_sub(2).filter(|&w| w >= 8)?;
+        let visible = usize::from(cols).min(SLICES);
+        let first = scroll
+            .min(cursor)
+            .max((cursor + 1).saturating_sub(visible))
+            .min(SLICES - visible);
+        let levels = Rect::new(inner.x + 1, inner.y + 1, visible as u16, levels_h);
+        let sens = Rect {
+            y: levels.bottom() + 1,
+            height: SENS_ROWS,
+            ..levels
+        };
+        Some(FreqGeom {
+            levels,
+            sens,
+            first,
+        })
+    }
+
+    /// The slice whose column is at screen column `x`.
+    pub fn slice_at(&self, x: u16) -> Option<usize> {
+        (self.levels.x..self.levels.right())
+            .contains(&x)
+            .then(|| self.first + usize::from(x - self.levels.x))
+    }
+
+    /// The sensitivity a click on screen row `y` of the strip sets: the bottom row is
+    /// off, the top one SENS_MAX.
+    pub fn sens_at(&self, y: u16) -> Option<f32> {
+        (self.sens.y..self.sens.bottom()).contains(&y).then(|| {
+            let from_bottom = f32::from(self.sens.bottom() - 1 - y);
+            from_bottom / f32::from(SENS_ROWS - 1) * SENS_MAX
+        })
+    }
+}
+
+fn band_color(band: Band) -> Color {
+    match band {
+        Band::Bass => Color::Rgb(255, 60, 75),
+        Band::Mid => Color::Rgb(255, 160, 60),
+        Band::High => Color::Rgb(90, 200, 255),
+    }
+}
+
+/// The band slice `i` is grouped in.
+pub fn band_of(i: usize) -> Band {
+    Band::of_slice(i)
+}
+
+/// `from` moved toward `to` by `t` (0..1).
+fn mix(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let m = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
+    Color::Rgb(m(from.0, to.0), m(from.1, to.1), m(from.2, to.2))
+}
+
+/// Axis label for a column whose slice starts at `hz`.
+fn axis_label(hz: u32) -> Option<String> {
+    match hz {
+        100 | 250 | 500 => Some(hz.to_string()),
+        _ if hz >= 1_000 && hz.is_multiple_of(1_000) => Some(format!("{}k", hz / 1_000)),
+        _ => None,
+    }
+}
+
+/// The frequency page: a panel across the screen with a tall live level column per
+/// 50 Hz slice, and under it each slice's sensitivity.
+fn draw_freq_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    const BG: Color = Color::Rgb(14, 6, 9);
+    f.render_widget(Clear, area);
+    let block = rounded()
+        .border_style(Style::new().fg(ACCENT))
+        .style(Style::new().bg(BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.fx_menu_rect = Some(inner);
+    draw_page_tabs(
+        f,
+        app,
+        Rect {
+            x: area.x + 1,
+            width: area.width.saturating_sub(2),
+            height: 1,
+            ..area
+        },
+    );
+    app.freq_cursor = app.freq_cursor.min(SLICES - 1);
+    let Some(geom) = FreqGeom::new(inner, app.freq_cursor, app.freq_scroll) else {
+        return;
+    };
+    app.freq_scroll = geom.first;
+    app.freq_geom = Some(geom);
+    f.render_widget(
+        FreqView {
+            analyzer: &app.analyzer,
+            geom,
+            cursor: app.freq_cursor,
+            selected: app.freq_selection(),
+        },
+        inner,
+    );
+}
+
+/// Draws the frequency panel's inside (see `draw_freq_panel`).
+struct FreqView<'a> {
+    analyzer: &'a Analyzer,
+    geom: FreqGeom,
+    cursor: usize,
+    /// The slices that keys and clicks change; includes the cursor.
+    selected: std::ops::RangeInclusive<usize>,
+}
+
+impl Widget for FreqView<'_> {
+    fn render(self, inner: Rect, buf: &mut Buffer) {
+        let FreqView {
+            analyzer,
+            geom,
+            cursor,
+            selected,
+        } = self;
+        let FreqGeom {
+            levels,
+            sens,
+            first,
+        } = geom;
+        const CURSOR_BG: Color = Color::Rgb(80, 18, 32);
+        const SELECTED_BG: Color = Color::Rgb(45, 12, 22);
+        const OFF: Color = Color::Rgb(70, 70, 82);
+
+        // Header: the slices that are on, as ranges, and a dot that lights on beats.
+        let mut spans = vec![Span::styled(" on ", Style::new().fg(DIM))];
+        let mut i = 0;
+        while i < SLICES {
+            if analyzer.slice_sensitivity(i) == 0.0 {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < SLICES && analyzer.slice_sensitivity(i) > 0.0 {
+                i += 1;
+            }
+            spans.push(Span::styled(
+                format!("{}-{} ", slice_hz(start), slice_hz(i)),
+                Style::new().fg(band_color(band_of(start))),
+            ));
+        }
+        if spans.len() == 1 {
+            spans.push(Span::styled("nothing ", Style::new().fg(Color::Gray)));
+        }
+        spans.push(Span::styled("Hz  beat ", Style::new().fg(DIM)));
+        let glow = analyzer.pulse();
+        spans.push(Span::styled(
+            "●",
+            Style::new().fg(mix((40, 40, 48), (255, 40, 60), glow)),
+        ));
+        Line::from(spans).render(Rect { height: 1, ..inner }, buf);
+
+        for col in 0..levels.width {
+            let i = first + usize::from(col);
+            let x = levels.x + col;
+            let v = analyzer.slice_sensitivity(i);
+            let on = v > 0.0;
+            let here = i == cursor;
+            let chosen = selected.contains(&i);
+            let color = if on { band_color(band_of(i)) } else { OFF };
+            // A slice's own hits flash its level column white.
+            let flash = match color {
+                Color::Rgb(r, g, b) => mix((r, g, b), (255, 255, 255), analyzer.slice_glow(i)),
+                c => c,
+            };
+            let bg = match (here, chosen) {
+                (true, _) => Some(CURSOR_BG),
+                (false, true) => Some(SELECTED_BG),
+                _ => None,
+            };
+
+            // A vertical bar of `eighths`, bottom up, in `rect`'s column x.
+            let mut bar = |rect: Rect, eighths: usize, fg: Color| {
+                for r in 0..rect.height {
+                    let y = rect.bottom() - 1 - r;
+                    let filled = eighths.saturating_sub(usize::from(r) * 8).min(8);
+                    let cell = &mut buf[(x, y)];
+                    cell.set_char(BARS[filled]).set_fg(fg);
+                    if let Some(bg) = bg {
+                        cell.set_bg(bg);
+                    }
+                }
+            };
+            let level = analyzer.slice_levels[i];
+            bar(
+                levels,
+                (level * f32::from(levels.height) * 8.0).round() as usize,
+                flash,
+            );
+            bar(
+                sens,
+                (v / SENS_MAX * f32::from(SENS_ROWS) * 8.0).round() as usize,
+                if chosen && on { Color::White } else { color },
+            );
+            if !on {
+                buf[(x, sens.bottom() - 1)].set_char('·').set_fg(OFF);
+            }
+
+            // Axis between the two: a line, band edges, frequency labels.
+            let axis = &mut buf[(x, levels.bottom())];
+            let edge = i > 0 && band_of(i) != band_of(i - 1);
+            let (ch, fg) = match (edge, chosen) {
+                (true, _) => ('┼', Color::Gray),
+                (false, true) => ('━', ACCENT),
+                (false, false) => ('─', Color::Rgb(70, 20, 30)),
+            };
+            axis.set_char(ch).set_fg(fg);
+        }
+        // Labels over the axis line, skipping any that would overlap the last one.
+        let mut free_from = levels.x;
+        for col in 0..levels.width {
+            let i = first + usize::from(col);
+            let x = levels.x + col;
+            let Some(label) = axis_label(slice_hz(i)) else {
+                continue;
+            };
+            let w = label.len() as u16;
+            if x < free_from || x + w > levels.right() {
+                continue;
+            }
+            for (k, ch) in label.chars().enumerate() {
+                buf[(x + k as u16, levels.bottom())]
+                    .set_char(ch)
+                    .set_fg(Color::Gray);
+            }
+            free_from = x + w + 1;
+        }
+        // The cursor's mark, unless a label is there (its column is highlighted anyway).
+        if let Some(col) = cursor
+            .checked_sub(first)
+            .filter(|&c| c < usize::from(levels.width))
+        {
+            let cell = &mut buf[(levels.x + col as u16, levels.bottom())];
+            if matches!(cell.symbol(), "─" | "━" | "┼") {
+                cell.set_char('▲').set_fg(Color::White);
+            }
+        }
+
+        // Info: the selected slices, then the keys.
+        let (lo, hi) = (*selected.start(), *selected.end());
+        let fmt = |v: f32| {
+            if v == 0.0 {
+                "off".to_string()
+            } else {
+                format!("{v:.1}")
+            }
+        };
+        let (min, max) = selected
+            .clone()
+            .map(|i| analyzer.slice_sensitivity(i))
+            .fold((f32::MAX, 0.0f32), |(a, b), v| (a.min(v), b.max(v)));
+        let bands: Vec<&str> = Band::ALL
+            .into_iter()
+            .filter(|b| b.slices().any(|i| selected.contains(&i)))
+            .map(Band::label)
+            .collect();
+        let mut spans = vec![Span::styled(
+            format!(" {}-{} Hz ", slice_hz(lo), slice_hz(hi) + SLICE_HZ),
+            Style::new().fg(Color::White).bold(),
+        )];
+        if hi > lo {
+            // Several slices: only they are heard (see `App::solo`).
+            spans.extend([
+                Span::styled(
+                    format!("{} slices ", hi - lo + 1),
+                    Style::new().fg(Color::Gray),
+                ),
+                Span::styled("♪ solo ", Style::new().fg(ACCENT).bold()),
+            ]);
+        }
+        spans.extend([
+            Span::styled(
+                format!("{} ", bands.join("+")),
+                Style::new().fg(band_color(band_of(cursor))),
+            ),
+            Span::styled(
+                if min == max {
+                    fmt(min)
+                } else {
+                    format!("{}-{}", fmt(min), fmt(max))
+                },
+                Style::new().fg(Color::Gray),
+            ),
+            Span::styled(
+                "   ←→ pick  opt ←→ ×10  shift ←→ select  a band  ↑↓ set  0 off  spc default  c reset all  tab effects",
+                Style::new().fg(DIM),
+            ),
+        ]);
+        let info = Line::from(spans);
+        info.render(
+            Rect {
+                y: inner.bottom() - 1,
+                height: 1,
+                ..inner
+            },
+            buf,
+        );
+    }
 }
 
 fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
@@ -955,14 +1502,22 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("m", "radio: queue videos like this one"),
             ("z", "shuffle the rest of the queue"),
             ("b / tab", "browse while it keeps playing"),
-            ("s", "toggle bass sync (off = steady fx + random hits)"),
+            (
+                "s",
+                "toggle sync to the slices on (off = steady fx + random hits)",
+            ),
             ("p / P", "next / previous preset"),
             ("e / FX button", "effects menu: pick any of the effects"),
             (
                 "  in the menu",
                 "↑↓ jk move, space/enter toggle, c clear all",
             ),
+            (
+                "  tab in the menu",
+                "freq panel: ←→ pick (opt ×10), shift ←→ / a select, ↑↓ set",
+            ),
             ("[ / ]", "effect intensity down / up"),
+            (", / .", "audio delay -10 / +10 ms (bluetooth lag)"),
             ("← / →", "seek -10s / +10s"),
             ("↑ / ↓", "volume up / down"),
             ("r / R", "resolution up / down (graphics renderer)"),
@@ -975,8 +1530,8 @@ fn draw_help(f: &mut Frame, playing: bool) {
     } else {
         &[
             (
-                "1-6 / tab",
-                "search, home, subscriptions, library, queue, history",
+                "1-7 / tab",
+                "search, home, subscriptions, library, queue, history, settings",
             ),
             ("/ or i", "search (ctrl-t: videos / playlists / channels)"),
             ("enter", "play video / open playlist or channel"),
@@ -1184,5 +1739,128 @@ impl Widget for HalfBlocks<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The text of screen row `y` of `buf` within `area`.
+    fn row(buf: &Buffer, area: Rect, y: u16) -> String {
+        (area.x..area.right())
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn freq_columns_show_level_and_sensitivity() {
+        let mut a = Analyzer::new(48_000);
+        a.set_slice_sensitivity(0, SENS_MAX);
+        a.set_slice_sensitivity(1, 0.5);
+        a.set_slice_sensitivity(2, 0.0);
+        a.slice_levels[0] = 1.0;
+        a.slice_levels[1] = 0.5;
+        // Header, 4 level rows, axis, 5 sensitivity rows, info.
+        let inner = Rect::new(1, 1, 30, 12);
+        let geom = FreqGeom::new(inner, 1, 0).unwrap();
+        assert_eq!(geom.levels, Rect::new(2, 2, 28, 4));
+        assert_eq!(geom.sens, Rect::new(2, 7, 28, 5));
+        let mut buf = Buffer::empty(inner);
+        FreqView {
+            analyzer: &a,
+            geom,
+            cursor: 1,
+            selected: 1..=1,
+        }
+        .render(inner, &mut buf);
+        let col = |x: u16, rows: std::ops::Range<u16>| -> String {
+            rows.map(|y| buf[(x, y)].symbol().to_string()).collect()
+        };
+        // Levels top-down: full, half; sensitivity: full, a quarter, off.
+        assert_eq!(col(2, 2..6), "████");
+        assert_eq!(col(3, 2..6), "  ██");
+        assert_eq!(col(2, 7..12), "█████");
+        assert_eq!(col(3, 7..12), "   ▂█");
+        assert_eq!(col(4, 7..12), "    ·");
+        // The axis marks the cursor, the 100 Hz label and the bass / mid edge.
+        let axis = row(&buf, inner, 6);
+        assert_eq!(axis.chars().take(8).collect::<String>(), " ─▲100┼─");
+        assert!(row(&buf, inner, 12).starts_with(" 50-100 Hz bass 0.5"));
+    }
+
+    #[test]
+    fn freq_header_lists_the_slices_that_are_on() {
+        let mut a = Analyzer::new(48_000);
+        a.set_slice_sensitivity(20, 1.0);
+        let inner = Rect::new(0, 0, 60, 12);
+        let geom = FreqGeom::new(inner, 0, 0).unwrap();
+        let mut buf = Buffer::empty(inner);
+        FreqView {
+            analyzer: &a,
+            geom,
+            cursor: 0,
+            selected: 0..=0,
+        }
+        .render(inner, &mut buf);
+        assert!(
+            row(&buf, inner, 0).starts_with(" on 0-150 1000-1050 Hz  beat ●"),
+            "{}",
+            row(&buf, inner, 0)
+        );
+    }
+
+    #[test]
+    fn freq_selection_is_marked_and_summed_up() {
+        let mut a = Analyzer::new(48_000);
+        a.set_slice_sensitivity(1, 0.4);
+        let inner = Rect::new(0, 0, 50, 12);
+        let geom = FreqGeom::new(inner, 6, 0).unwrap();
+        let mut buf = Buffer::empty(inner);
+        FreqView {
+            analyzer: &a,
+            geom,
+            cursor: 6,
+            selected: 1..=6,
+        }
+        .render(inner, &mut buf);
+        let axis: String = row(&buf, inner, 5).chars().take(9).collect();
+        // Slice 2 is under the 100 label, 5 is the bass / mid edge, 6 the cursor.
+        assert_eq!(axis, " ─━100┼▲─");
+        let info = row(&buf, inner, 11);
+        assert!(
+            info.starts_with(" 50-350 Hz 6 slices ♪ solo bass+mid off-1.0"),
+            "{info}"
+        );
+        // Selected columns are shaded, the cursor more.
+        assert_eq!(buf[(2, 1)].bg, Color::Rgb(45, 12, 22));
+        assert_eq!(buf[(7, 1)].bg, Color::Rgb(80, 18, 32));
+        assert_eq!(buf[(8, 1)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn freq_clicks_map_to_slice_and_value() {
+        let inner = Rect::new(0, 0, 40, 14);
+        let geom = FreqGeom::new(inner, 0, 0).unwrap();
+        assert_eq!(geom.slice_at(geom.levels.x), Some(0));
+        assert_eq!(geom.slice_at(geom.levels.x + 7), Some(7));
+        assert_eq!(geom.slice_at(geom.levels.right()), None);
+        let s = geom.sens;
+        assert_eq!(geom.sens_at(s.y), Some(SENS_MAX));
+        assert_eq!(geom.sens_at(s.y + 2), Some(1.0));
+        assert_eq!(geom.sens_at(s.bottom() - 1), Some(0.0));
+        assert_eq!(geom.sens_at(s.bottom()), None);
+    }
+
+    #[test]
+    fn freq_panel_scrolls_to_the_cursor() {
+        let inner = Rect::new(0, 0, 42, 14);
+        assert_eq!(FreqGeom::new(inner, 100, 0).unwrap().first, 61);
+        assert_eq!(FreqGeom::new(inner, 3, 61).unwrap().first, 3);
+        let last = FreqGeom::new(inner, SLICES - 1, 0).unwrap();
+        assert_eq!(last.first, SLICES - 40);
+        assert_eq!(last.slice_at(last.levels.right() - 1), Some(SLICES - 1));
+        // Too small: no panel.
+        assert!(FreqGeom::new(Rect::new(0, 0, 42, 9), 0, 0).is_none());
     }
 }

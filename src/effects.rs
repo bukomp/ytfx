@@ -1,8 +1,9 @@
 //! "Edit" style frame effects. Everything works on packed RGB24 buffers, and every
-//! effect is scaled by the drive signal (bass/mid/high pulse when synced).
+//! effect is scaled by the drive signal (the beat pulse when synced).
 
-/// What the effects react to. `pulse` jumps on a bass beat (less on mid and high hits)
-/// and decays, `level` follows bass energy. `beat` is set on bass beats only.
+/// What the effects react to. `pulse` jumps on a beat (a hit in any frequency slice
+/// that is on) and decays, `level` follows the energy of those slices. `beat` is set
+/// on the frame of a beat, `strength` says how hard it was.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Drive {
     pub pulse: f32,

@@ -13,6 +13,7 @@ mod ui;
 mod youtube;
 
 use std::io::{BufWriter, Stdout, stdout};
+use std::ops::RangeInclusive;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -34,7 +35,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
 use account::Account;
-use analysis::Analyzer;
+use analysis::{Analyzer, SLICE_HZ, SLICES};
 use audio::AudioOut;
 use effects::{Backdrop, Drive, Effects, Fx, PRESETS, Rng};
 use history::History;
@@ -80,7 +81,7 @@ options:
                      144, 240, 360, 480 (default), 720 or 1080
   --renderer <name>  auto (default), kitty (pixel graphics) or blocks (text cells)
   --max-width <n>    max video width in columns for the blocks renderer (default 200)
-  --no-sync          start with bass sync off
+  --no-sync          start with sync off
   --volume <0-200>   start volume in percent (default 80)
   --cookies <file>   use a Netscape cookies.txt for this session only
   --cookies-from-browser <name>
@@ -89,6 +90,24 @@ options:
 
 To stay signed in, press L in the app.
 Needs yt-dlp and ffmpeg on PATH, and a truecolor terminal.";
+
+/// What a mouse drag on the frequency panel does.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FreqDrag {
+    /// Selects from `freq_anchor` to the slice under the pointer.
+    Select,
+    /// Sets sensitivities. The last (slice, value), to fill in the columns a fast drag
+    /// skips.
+    Paint(usize, f32),
+}
+
+/// The two pages of the effects menu.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FxPage {
+    Effects,
+    /// Hit sensitivity per 50 Hz slice.
+    Freq,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Renderer {
@@ -212,16 +231,19 @@ pub enum Tab {
     Library,
     Queue,
     History,
+    /// App-wide settings: the audio output delay.
+    Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Search,
         Tab::Home,
         Tab::Subs,
         Tab::Library,
         Tab::Queue,
         Tab::History,
+        Tab::Settings,
     ];
 
     pub fn label(self) -> &'static str {
@@ -232,6 +254,7 @@ impl Tab {
             Tab::Library => "library",
             Tab::Queue => "queue",
             Tab::History => "history",
+            Tab::Settings => "settings",
         }
     }
 
@@ -243,6 +266,7 @@ impl Tab {
             Tab::Library => ListView::fixed("library", youtube::library()),
             Tab::Queue => ListView::fixed("queue", Vec::new()),
             Tab::History => ListView::fixed("history", Vec::new()),
+            Tab::Settings => ListView::fixed("settings", Vec::new()),
         }
     }
 }
@@ -324,7 +348,7 @@ pub struct App {
     cfg: Config,
     pub tab: Tab,
     /// Per tab, the root list and the lists opened from it.
-    pub tabs: [Vec<ListView>; 6],
+    pub tabs: [Vec<ListView>; Tab::ALL.len()],
     pub focus: Focus,
     pub query: TextInput,
     /// Where the search field's text is on screen, for mouse clicks. Set while drawing.
@@ -363,6 +387,12 @@ pub struct App {
     pub effects: Effects,
     pub analyzer: Analyzer,
     pub drive: Drive,
+    /// The beat pulse from the audio (even with sync off), for the settings tab's
+    /// beat light.
+    pub heard_pulse: f32,
+    /// How long the audio output takes to be heard (Bluetooth headphones: 150-300 ms).
+    /// The video and the effects wait this long.
+    pub audio_delay_ms: u32,
     pub sync: bool,
     pub preset: usize,
     pub show_hud: bool,
@@ -372,11 +402,23 @@ pub struct App {
     pub fx_menu: bool,
     pub fx_cursor: usize,
     pub fx_scroll: usize,
+    /// Which page of the menu shows, and the selected slice and first visible column
+    /// of the frequency panel.
+    pub fx_page: FxPage,
+    pub freq_cursor: usize,
+    pub freq_scroll: usize,
+    /// The other end of a selection of slices, from here to `freq_cursor`.
+    pub freq_anchor: Option<usize>,
     /// Set by ui::draw for mouse clicks: the FX button, the menu's inside, and which
     /// effect each menu row shows (screen row, index into `Fx::ALL`).
     pub fx_button: Option<Rect>,
     pub fx_menu_rect: Option<Rect>,
     pub fx_rows: Vec<(u16, usize)>,
+    /// The menu's page tabs and where the frequency panel's parts are.
+    pub fx_tabs: Vec<(Rect, FxPage)>,
+    pub freq_geom: Option<ui::FreqGeom>,
+    /// What the mouse drag on the frequency panel that is going on does.
+    freq_drag: Option<FreqDrag>,
     /// What's shown: the effects output, on a backdrop canvas when `fill` is on.
     pub frame_out: Vec<u8>,
     pub frame_dims: (usize, usize),
@@ -409,6 +451,8 @@ pub struct App {
     pub ticks: u64,
     area: Rect,
     tap: Vec<f32>,
+    /// Samples heard in all at the last tap snapshot (see `AudioShared::tap_snapshot`).
+    tap_heard: u64,
     resize_at: Option<Instant>,
     rng: Rng,
     free_pulse: f32,
@@ -465,15 +509,24 @@ impl App {
             effects: Effects::new(&PRESETS[0]),
             analyzer,
             drive: Drive::default(),
+            heard_pulse: 0.0,
+            audio_delay_ms: 0,
             preset: 0,
             show_hud: true,
             show_help: false,
             fx_menu: false,
             fx_cursor: 0,
             fx_scroll: 0,
+            fx_page: FxPage::Effects,
+            freq_cursor: 0,
+            freq_scroll: 0,
+            freq_anchor: None,
             fx_button: None,
             fx_menu_rect: None,
             fx_rows: Vec::new(),
+            fx_tabs: Vec::new(),
+            freq_geom: None,
+            freq_drag: None,
             frame_out: Vec::new(),
             frame_dims: (0, 0),
             fx_out: Vec::new(),
@@ -498,6 +551,7 @@ impl App {
             ticks: 0,
             area: Rect::default(),
             tap: Vec::new(),
+            tap_heard: 0,
             resize_at: None,
             rng: Rng::new(seed),
             free_pulse: 0.0,
@@ -1096,6 +1150,13 @@ impl App {
             self.refill_radio();
             self.prefetch_next();
         }
+        // The sync test only runs on the settings tab.
+        let on_settings =
+            self.tab == Tab::Settings && !self.show_video && self.account_ui.is_none();
+        if self.audio.shared.test_on() && !on_settings {
+            self.audio.shared.set_test(false);
+        }
+        self.audio.shared.set_solo(self.solo());
 
         let Some(p) = self.player.as_mut() else {
             return;
@@ -1140,9 +1201,14 @@ impl App {
         let analysis = if paused {
             self.analyzer.idle(dt)
         } else {
-            self.audio.shared.tap_snapshot(&mut self.tap);
-            self.analyzer.update(&self.tap, dt)
+            // Only what was heard since the last frame is new (after a seek the
+            // count starts over).
+            let heard = self.audio.shared.tap_snapshot(&mut self.tap);
+            let new = heard.checked_sub(self.tap_heard).unwrap_or(heard);
+            self.tap_heard = heard;
+            self.analyzer.update(&self.tap, new as usize)
         };
+        self.heard_pulse = analysis.pulse;
         self.drive = if self.sync || paused {
             analysis
         } else {
@@ -1158,7 +1224,7 @@ impl App {
                 let mut h = DefaultHasher::new();
                 (f.pts.to_bits(), f.w, f.h, self.effects.enabled()).hash(&mut h);
                 (self.effects.intensity.to_bits(), self.fill, self.crop, area).hash(&mut h);
-                (self.renderer == Renderer::Kitty, self.fx_menu).hash(&mut h);
+                (self.renderer == Renderer::Kitty, self.open_menu()).hash(&mut h);
                 self.cell_aspect.to_bits().hash(&mut h);
                 // Keep rendering until the last hit has faded out, then hold still.
                 ((self.drive.pulse * 20.0) as u32).hash(&mut h);
@@ -1211,6 +1277,52 @@ impl App {
 
     /// Canvas size in pixels that covers the whole video area around a fw x fh frame,
     /// when the frame alone would leave empty space (and fill is on).
+    /// The effects menu page on screen, if the menu is open.
+    pub fn open_menu(&self) -> Option<FxPage> {
+        self.fx_menu.then_some(self.fx_page)
+    }
+
+    fn show_delay(&mut self) {
+        self.status = Some((format!("audio delay {} ms", self.audio_delay_ms), false));
+    }
+
+    /// Set the audio output delay (clamped to 0..=MAX_DELAY_MS).
+    fn set_audio_delay(&mut self, ms: u32) {
+        self.audio_delay_ms = ms.min(audio::MAX_DELAY_MS);
+        let frames = u64::from(self.audio.rate) * u64::from(self.audio_delay_ms) / 1_000;
+        self.audio.shared.set_delay_frames(frames);
+    }
+
+    /// Change the audio delay by `delta` ms and save it.
+    fn nudge_audio_delay(&mut self, delta: i32) {
+        let ms = (self.audio_delay_ms as i32 + delta).max(0) as u32;
+        self.set_audio_delay(ms);
+        self.save_settings();
+    }
+
+    /// Keys of the settings tab. Returns false for keys it leaves to the browser.
+    fn settings_key(&mut self, k: KeyEvent) -> bool {
+        let step = if k.modifiers.contains(KeyModifiers::SHIFT) {
+            50
+        } else {
+            10
+        };
+        match k.code {
+            KeyCode::Left | KeyCode::Char('-') => self.nudge_audio_delay(-step),
+            KeyCode::Right | KeyCode::Char('+' | '=') => self.nudge_audio_delay(step),
+            KeyCode::Char('0') => {
+                self.set_audio_delay(0);
+                self.save_settings();
+            }
+            KeyCode::Char('t') | KeyCode::Enter => {
+                let shared = &self.audio.shared;
+                shared.set_test(!shared.test_on());
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn fill_canvas(
         &self,
         area: Rect,
@@ -1218,7 +1330,7 @@ impl App {
         fh: usize,
         crop: effects::Crop,
     ) -> Option<(usize, usize)> {
-        let video = ui::video_area(area, self.fx_menu);
+        let video = ui::video_area(area, self.open_menu());
         if !self.fill || video.width == 0 || video.height == 0 {
             return None;
         }
@@ -1259,6 +1371,13 @@ impl App {
         self.sync = self.sync && s.sync.unwrap_or(true);
         self.fill = s.fill.unwrap_or(true);
         self.show_preview = s.preview.unwrap_or(true);
+        self.set_audio_delay(s.audio_delay_ms.unwrap_or(0));
+        for (hz, v) in s.freq_sensitivity.unwrap_or_default() {
+            if hz % SLICE_HZ == 0 {
+                self.analyzer
+                    .set_slice_sensitivity((hz / SLICE_HZ) as usize, v);
+            }
+        }
     }
 
     fn save_settings(&mut self) {
@@ -1275,6 +1394,14 @@ impl App {
             sync: Some(self.sync),
             fill: Some(self.fill),
             preview: Some(self.show_preview),
+            audio_delay_ms: Some(self.audio_delay_ms),
+            freq_sensitivity: Some(
+                (0..SLICES)
+                    .map(|i| (i, self.analyzer.slice_sensitivity(i)))
+                    .filter(|&(i, v)| v != analysis::default_slice_sensitivity(i))
+                    .map(|(i, v)| (analysis::slice_hz(i), (v * 10.0).round() / 10.0))
+                    .collect(),
+            ),
         };
         if let Err(e) = settings::save(&s) {
             self.status = Some((format!("couldn't save settings: {e:#}"), true));
@@ -1285,7 +1412,7 @@ impl App {
     fn decode_size(&self, area: Rect, aspect: f64) -> (usize, usize) {
         match self.renderer {
             Renderer::Blocks => ui::fit(
-                ui::video_area(area, self.fx_menu),
+                ui::video_area(area, self.open_menu()),
                 aspect,
                 self.cfg.max_width,
             ),
@@ -1379,6 +1506,9 @@ impl App {
             return;
         }
 
+        if self.tab == Tab::Settings && self.settings_key(k) {
+            return;
+        }
         let len = if self.tab == Tab::Queue {
             self.queue.items.len()
         } else {
@@ -1413,7 +1543,7 @@ impl App {
                 self.tab = Tab::Search;
                 self.focus = Focus::Search;
             }
-            KeyCode::Char(c @ '1'..='6') => self.switch_tab(Tab::ALL[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='7') => self.switch_tab(Tab::ALL[c as usize - '1' as usize]),
             KeyCode::Tab => self.switch_tab(Tab::ALL[(self.tab as usize + 1) % Tab::ALL.len()]),
             KeyCode::BackTab => {
                 self.switch_tab(Tab::ALL[(self.tab as usize + Tab::ALL.len() - 1) % Tab::ALL.len()])
@@ -1567,6 +1697,32 @@ impl App {
 
     /// Keys for the open effects menu. Returns false for keys it leaves to the player.
     fn fx_menu_key(&mut self, k: KeyEvent) -> bool {
+        match k.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.fx_page = match self.fx_page {
+                    FxPage::Effects => FxPage::Freq,
+                    FxPage::Freq => FxPage::Effects,
+                };
+                return true;
+            }
+            // Esc first drops a selection of slices.
+            KeyCode::Esc if self.fx_page == FxPage::Freq && self.freq_anchor.is_some() => {
+                self.freq_anchor = None;
+                return true;
+            }
+            KeyCode::Esc | KeyCode::Char('e') => {
+                self.fx_menu = false;
+                return true;
+            }
+            _ => {}
+        }
+        match self.fx_page {
+            FxPage::Effects => self.effects_page_key(k),
+            FxPage::Freq => self.freq_page_key(k),
+        }
+    }
+
+    fn effects_page_key(&mut self, k: KeyEvent) -> bool {
         let n = Fx::ALL.len();
         match k.code {
             KeyCode::Up | KeyCode::Char('k') => self.fx_cursor = (self.fx_cursor + n - 1) % n,
@@ -1580,8 +1736,88 @@ impl App {
                 self.effects.set_enabled(&[]);
                 self.save_settings();
             }
-            KeyCode::Esc | KeyCode::Char('e') => self.fx_menu = false,
             _ => return false,
+        }
+        true
+    }
+
+    /// The selected slices: from `freq_anchor` to `freq_cursor`, or just the cursor.
+    /// While several slices are selected on the frequency page, only their
+    /// frequencies are heard: (lowest, highest) Hz.
+    pub fn solo(&self) -> Option<(u32, u32)> {
+        let sel = self.freq_selection();
+        let on_page = self.show_video && self.open_menu() == Some(FxPage::Freq);
+        (on_page && sel.end() > sel.start()).then(|| {
+            let hz = analysis::slice_hz;
+            (hz(*sel.start()), hz(*sel.end()) + SLICE_HZ)
+        })
+    }
+
+    pub fn freq_selection(&self) -> RangeInclusive<usize> {
+        let cursor = self.freq_cursor.min(SLICES - 1);
+        let anchor = self.freq_anchor.unwrap_or(cursor).min(SLICES - 1);
+        anchor.min(cursor)..=anchor.max(cursor)
+    }
+
+    /// The frequency panel: left / right pick a slice (with option, 10 at a time; with
+    /// shift, grow a selection), up / down move every selected slice.
+    fn freq_page_key(&mut self, k: KeyEvent) -> bool {
+        let last = SLICES - 1;
+        let i = self.freq_cursor.min(last);
+        // Option (or ctrl) + arrow jumps 10 slices. Many macOS terminals send option +
+        // arrow as esc b / esc f.
+        let alt = k
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+        let step = if alt { 10 } else { 1 };
+        let to = match k.code {
+            KeyCode::Left => Some(i.saturating_sub(step)),
+            KeyCode::Right => Some((i + step).min(last)),
+            KeyCode::Char('b') if alt => Some(i.saturating_sub(10)),
+            KeyCode::Char('f') if alt => Some((i + 10).min(last)),
+            KeyCode::PageUp => Some(i.saturating_sub(20)),
+            KeyCode::PageDown => Some((i + 20).min(last)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(last),
+            _ => None,
+        };
+        if let Some(to) = to {
+            if k.modifiers.contains(KeyModifiers::SHIFT) {
+                self.freq_anchor.get_or_insert(i);
+            } else {
+                self.freq_anchor = None;
+            }
+            self.freq_cursor = to;
+            return true;
+        }
+        let sel = self.freq_selection();
+        let changed = match k.code {
+            KeyCode::Up | KeyCode::Char('+' | '=') => self.analyzer.nudge_slices(sel, 1.0),
+            KeyCode::Down | KeyCode::Char('-') => self.analyzer.nudge_slices(sel, -1.0),
+            KeyCode::Char('0') => self.analyzer.set_slices(sel, |_| 0.0),
+            KeyCode::Char(' ') | KeyCode::Enter => self
+                .analyzer
+                .set_slices(sel, analysis::default_slice_sensitivity),
+            KeyCode::Char('c') => {
+                self.analyzer.reset_sensitivity();
+                true
+            }
+            KeyCode::Char('a') => {
+                // Select the cursor's band; again drops the selection.
+                let band = ui::band_of(i).slices();
+                let whole = band.start..=band.end - 1;
+                if sel == whole {
+                    self.freq_anchor = None;
+                } else {
+                    self.freq_anchor = Some(*whole.start());
+                    self.freq_cursor = *whole.end();
+                }
+                false
+            }
+            _ => return false,
+        };
+        if changed {
+            self.save_settings();
         }
         true
     }
@@ -1637,19 +1873,109 @@ impl App {
             return;
         }
         let in_menu = self.fx_menu_rect.is_some_and(|r| r.contains(pos));
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if self.fx_button.is_some_and(|r| r.contains(pos)) {
-                    self.fx_menu = !self.fx_menu;
-                } else if let Some(i) = ui::fx_row_at(self, pos) {
-                    self.toggle_fx(i);
+        if matches!(m.kind, MouseEventKind::Up(_)) {
+            // A click without a drag selects just that slice.
+            if self.freq_drag == Some(FreqDrag::Select)
+                && self.freq_anchor == Some(self.freq_cursor)
+            {
+                self.freq_anchor = None;
+            }
+            self.freq_drag = None;
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            if self.fx_button.is_some_and(|r| r.contains(pos)) {
+                self.fx_menu = !self.fx_menu;
+                return;
+            }
+            if let Some(&(_, page)) = self.fx_tabs.iter().find(|t| t.0.contains(pos)) {
+                self.fx_page = page;
+                return;
+            }
+        }
+        if !in_menu {
+            return;
+        }
+        match self.fx_page {
+            FxPage::Effects => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(i) = ui::fx_row_at(self, pos) {
+                        self.toggle_fx(i);
+                    }
+                }
+                MouseEventKind::ScrollUp => self.fx_cursor = self.fx_cursor.saturating_sub(1),
+                MouseEventKind::ScrollDown => {
+                    self.fx_cursor = (self.fx_cursor + 1).min(Fx::ALL.len() - 1)
+                }
+                _ => {}
+            },
+            FxPage::Freq => self.freq_mouse(m.kind, pos),
+        }
+    }
+
+    /// In the level columns, click to pick a slice and drag to select a range. In the
+    /// sensitivity strip, click a row to set the slice (or the whole selection, when
+    /// the click is inside it) to that value, and drag to set every column on the way,
+    /// like drawing a curve.
+    fn freq_mouse(&mut self, kind: MouseEventKind, pos: Position) {
+        let Some(geom) = self.freq_geom else { return };
+        let last = SLICES - 1;
+        let down = matches!(kind, MouseEventKind::Down(MouseButton::Left));
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(i) = geom.slice_at(pos.x) else {
+                    return;
+                };
+                let in_levels = (geom.levels.y..=geom.levels.bottom()).contains(&pos.y);
+                let value = geom.sens_at(pos.y);
+                match (down, self.freq_drag, value) {
+                    // Start or grow a selection.
+                    (true, _, None) if in_levels => {
+                        self.freq_cursor = i;
+                        self.freq_anchor = Some(i);
+                        self.freq_drag = Some(FreqDrag::Select);
+                    }
+                    (false, Some(FreqDrag::Select), _) => self.freq_cursor = i,
+                    // A click inside a selection sets all of it.
+                    (true, _, Some(v))
+                        if self.freq_anchor.is_some() && self.freq_selection().contains(&i) =>
+                    {
+                        if self.analyzer.set_slices(self.freq_selection(), |_| v) {
+                            self.save_settings();
+                        }
+                        self.freq_drag = None;
+                    }
+                    (_, drag, Some(v)) => {
+                        let from = match drag {
+                            Some(FreqDrag::Paint(j, w)) if !down => (j, w),
+                            _ => (i, v),
+                        };
+                        self.freq_cursor = i;
+                        self.freq_anchor = None;
+                        self.freq_drag = Some(FreqDrag::Paint(i, v));
+                        let span = i as f32 - from.0 as f32;
+                        let lo = from.0.min(i);
+                        let changed = self.analyzer.set_slices(lo..=from.0.max(i), |j| {
+                            let t = if span == 0.0 {
+                                1.0
+                            } else {
+                                (j as f32 - from.0 as f32) / span
+                            };
+                            from.1 + (v - from.1) * t
+                        });
+                        if changed {
+                            self.save_settings();
+                        }
+                    }
+                    _ => {}
                 }
             }
-            MouseEventKind::ScrollUp if in_menu => {
-                self.fx_cursor = self.fx_cursor.saturating_sub(1);
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                self.freq_anchor = None;
+                self.freq_cursor = self.freq_cursor.saturating_sub(2)
             }
-            MouseEventKind::ScrollDown if in_menu => {
-                self.fx_cursor = (self.fx_cursor + 1).min(Fx::ALL.len() - 1);
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => {
+                self.freq_anchor = None;
+                self.freq_cursor = (self.freq_cursor + 2).min(last)
             }
             _ => {}
         }
@@ -1713,6 +2039,14 @@ impl App {
             KeyCode::Char('r') => return self.step_res(true),
             KeyCode::Char('R') => return self.step_res(false),
             KeyCode::Char('g') => return self.toggle_renderer(),
+            KeyCode::Char(',') => {
+                self.nudge_audio_delay(-10);
+                return self.show_delay();
+            }
+            KeyCode::Char('.') => {
+                self.nudge_audio_delay(10);
+                return self.show_delay();
+            }
             _ => {}
         }
         if matches!(k.code, KeyCode::Char('s' | 'f' | 'p' | 'P' | '[' | ']')) {
@@ -1755,7 +2089,7 @@ impl App {
         (
             self.busy.is_some(),
             self.show_help,
-            self.fx_menu,
+            self.open_menu(),
             self.account_ui.is_some(),
             &self.status,
             self.player.as_ref().map(|p| &p.title),
@@ -1838,7 +2172,10 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
         draw_image(term, app)?;
         execute!(term.backend_mut(), EndSynchronizedUpdate)?;
 
-        let fps = if app.show_video && app.player.is_some() {
+        // The settings tab's beat light needs the full rate too.
+        let fps = if (app.show_video || app.tab == Tab::Settings) && app.player.is_some()
+            || app.audio.shared.test_on()
+        {
             app.cfg.fps
         } else {
             20

@@ -116,9 +116,10 @@ impl Player {
         Ok(())
     }
 
-    /// Current playback position in seconds, driven by what the sound card has played.
+    /// Current playback position in seconds, driven by what has been heard: what the
+    /// sound card has played, minus the output delay.
     pub fn position(&self) -> f64 {
-        self.base + self.shared.played_frames() as f64 / self.rate as f64
+        self.base + self.shared.heard_frames() as f64 / self.rate as f64
     }
 
     pub fn size(&self) -> (usize, usize) {

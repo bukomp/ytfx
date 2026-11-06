@@ -1,7 +1,8 @@
-//! Settings that survive restarts: which effects are on, preset, intensity, bass sync,
-//! the background fill and the browser's preview pane. Saved to `settings.json` in the
+//! Settings that survive restarts: which effects are on, preset, intensity, sync,
+//! the hit sensitivity per 50 Hz slice, the audio output delay, the background fill and the browser's preview pane. Saved to `settings.json` in the
 //! config directory whenever one of them changes.
 
+use std::collections::BTreeMap;
 use std::fs;
 
 use anyhow::Result;
@@ -20,6 +21,11 @@ pub struct Settings {
     pub fill: Option<bool>,
     /// The browser's preview pane.
     pub preview: Option<bool>,
+    /// Hit sensitivity of the 50 Hz slices that differ from the default, keyed by the
+    /// slice's lowest frequency in Hz (see `analysis::default_slice_sensitivity`).
+    pub freq_sensitivity: Option<BTreeMap<u32, f32>>,
+    /// How long the audio output takes to be heard, in ms (see `audio::MAX_DELAY_MS`).
+    pub audio_delay_ms: Option<u32>,
 }
 
 /// The saved settings; anything missing or unreadable falls back to the defaults.
@@ -47,5 +53,17 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"effects":["zoom","nope"],"extra":1}"#).unwrap();
         assert_eq!(s.effects.unwrap(), ["zoom", "nope"]);
         assert_eq!(s.intensity, None);
+        assert_eq!(s.freq_sensitivity, None);
+    }
+
+    #[test]
+    fn slice_sensitivity_round_trips() {
+        let s: Settings =
+            serde_json::from_str(r#"{"freq_sensitivity":{"50":1.6,"150":0.4}}"#).unwrap();
+        let map = s.freq_sensitivity.clone().unwrap();
+        assert_eq!(map[&50], 1.6);
+        assert_eq!(map[&150], 0.4);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 }
