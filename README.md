@@ -1,6 +1,6 @@
 # ytfx
 
-A terminal YouTube browser. It searches with `yt-dlp` (no API key), plays the video in the terminal with audio (as real pixels in kitty, Ghostty and WezTerm, or as truecolor half-block characters elsewhere), and layers 37 "edit"-style effects on top (zoom punches, shake, glitches, colour grades, VHS, CRT, film and more), picked from a side menu. With SYNC on, the effects are driven by the frequency slices that are on (by default the bass, 0-150 Hz). Press `s` to turn SYNC off; the effects then stay at a steady level with random hits.
+A terminal YouTube browser. It searches with `yt-dlp` (no API key), plays the video in the terminal with audio (as real pixels in kitty, Ghostty and WezTerm, as sixel images in foot and other sixel terminals, or as truecolor half-block characters elsewhere), and layers 37 "edit"-style effects on top (zoom punches, shake, glitches, colour grades, VHS, CRT, film and more), picked from a side menu. With SYNC on, the effects are driven by the frequency slices that are on (by default the bass, 0-150 Hz). Press `s` to turn SYNC off; the effects then stay at a steady level with random hits.
 
 ## Requirements
 
@@ -22,7 +22,7 @@ Options (`ytfx [options] [search terms | youtube url]`):
 --fps <n>          video/render frame rate (default 30, clamped to 5-60)
 --res <height>     video resolution for the graphics renderer:
                    144, 240, 360, 480 (default), 720 or 1080
---renderer <name>  auto (default), kitty (pixel graphics) or blocks (text cells)
+--renderer <name>  auto (default), kitty or sixel (pixel graphics), blocks (text cells)
 --max-width <n>    max video width in columns for the blocks renderer (default 200)
 --no-sync          start with sync off
 --volume <0-200>   start volume in percent (default 80)
@@ -253,9 +253,10 @@ Radio: `r` in the browser starts radio from the selected video. `R` starts it fr
 
 ## Resolution
 
-There are two renderers:
+There are three renderers:
 
 - **Graphics (kitty protocol):** used automatically in kitty, Ghostty and WezTerm. The video is sent as a real image at the resolution you choose (`--res`, or `r` / `R` while playing), and the terminal scales it to fit the window. kitty receives frames through shared memory, so even 720p costs almost nothing to send. Other terminals receive them inline as base64.
+- **Graphics (sixel):** used automatically in terminals that report sixel support (foot, mlterm, xterm with sixel, Windows Terminal...). ytfx asks the terminal at startup, so it works whatever `TERM` says. The terminal doesn't scale sixel images, so ytfx resamples each frame to the pixel size of the video area, maps it to 252 colours with ordered dithering, and sends it as one image (about 0.7 MB and 10 ms per frame for a 1280x720 area). `r` / `R` set the source resolution, as with kitty. A paused frame is not sent again.
 - **Blocks:** used everywhere else, and inside tmux. Each cell shows two pixels with the `▀` character, so the resolution is the terminal grid. For example, 200 columns gives a 200x112 picture. To get more detail, make the font smaller.
 
 The source stream is fetched at 720p or at the chosen resolution, whichever is higher. At 720p, each preset takes about 0.7 to 3.2 ms per frame, and no single effect takes more than about 1.5 ms. With all 37 effects on at once, it takes about 3.7 ms at 360p, 14 ms at 720p and 32 ms at 1080p. Blur and glow run at reduced resolution, per-channel curves (poster, solar, strobe, flash, invert) are combined into one pass, and history buffers exist only while their effect is on. While paused, the effects stop running once the last hit has faded, until something changes (a seek, another effect, a resize). With no effects on, it costs almost nothing.
@@ -287,7 +288,9 @@ Video frames are scheduled against the audio clock (samples actually played, min
 - `src/audio.rs`: cpal output, volume, and the tap of played samples
 - `src/analysis.rs`: FFT, slice levels, per-slice beat detection
 - `src/effects.rs`: effect pipeline, presets, effect catalogue (groups, descriptions)
+- `src/graphics.rs`: picks between the kitty and sixel output
 - `src/kitty.rs`: kitty graphics protocol output (shared memory or inline base64)
+- `src/sixel.rs`: sixel output (terminal probe, resampling, dithering, encoder)
 - `src/ui.rs`: ratatui rendering (browser, HUD, effects menu, help, account dialog) and the half-block video widget
 
 ## Troubleshooting
@@ -298,7 +301,7 @@ Video frames are scheduled against the audio clock (samples actually played, min
   3. Press `L` and choose `f` to import a `cookies.txt` you exported yourself (ideally from a secondary Google account). Only that file is shared, and no browser or Keychain access is needed.
   4. Press `L` and choose `b` to let yt-dlp read your browser's cookie store. On macOS, Chromium browsers ask for Keychain access to decrypt it. Use this only if you are comfortable with that.
 - "YouTube says this sign-in is no longer valid" or empty Home / Subscriptions: a browser that is signed in to Google refreshes the whole Google session in the background, even with no YouTube tab open, and that invalidates exported copies. Export from a private window instead: sign in to YouTube, open `https://www.youtube.com/robots.txt` in the same tab, export the youtube.com cookies, and close the private window right away. Then import the file with `L` → `f`, or copy it to `~/.config/ytfx/cookies.txt`. That session belongs to ytfx alone, and ytfx keeps it fresh by saving the cookies YouTube updates after each request.
-- Low resolution: in kitty, Ghostty or WezTerm, press `r`. In other terminals, the blocks renderer is limited by the cell grid (see Resolution).
+- Low resolution: in kitty, Ghostty, WezTerm or a sixel terminal such as foot, press `r`. If `g` says the terminal shows no pixel graphics, try `--renderer sixel`. In other terminals, the blocks renderer is limited by the cell grid (see Resolution).
 - Choppy video: lower the resolution (`R`), `--max-width` or `--fps`.
 - Wrong or banded colors: the terminal probably lacks truecolor support. Use one that has it.
 

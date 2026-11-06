@@ -2,12 +2,14 @@ mod account;
 mod analysis;
 mod audio;
 mod effects;
+mod graphics;
 mod history;
 mod kitty;
 mod player;
 mod preview;
 mod queue;
 mod settings;
+mod sixel;
 mod textinput;
 mod ui;
 mod youtube;
@@ -38,10 +40,12 @@ use account::Account;
 use analysis::{Analyzer, SLICE_HZ, SLICES};
 use audio::AudioOut;
 use effects::{Backdrop, Drive, Effects, Fx, PRESETS, Rng};
+use graphics::Graphics;
 use history::History;
 use kitty::Kitty;
 use player::Player;
 use queue::{Queue, RADIO_LOW};
+use sixel::Sixel;
 use textinput::TextInput;
 use youtube::{Entry, Kind, SearchKind, StreamInfo};
 
@@ -79,7 +83,7 @@ options:
   --fps <n>          video/render frame rate (default 30)
   --res <height>     video resolution for the graphics renderer:
                      144, 240, 360, 480 (default), 720 or 1080
-  --renderer <name>  auto (default), kitty (pixel graphics) or blocks (text cells)
+  --renderer <name>  auto (default), kitty or sixel (pixel graphics), blocks (text cells)
   --max-width <n>    max video width in columns for the blocks renderer (default 200)
   --no-sync          start with sync off
   --volume <0-200>   start volume in percent (default 80)
@@ -113,14 +117,22 @@ pub enum FxPage {
 pub enum Renderer {
     /// Half-block characters: works everywhere, 2 pixels per cell.
     Blocks,
-    /// Kitty graphics protocol: real pixels at a chosen resolution.
+    /// Real pixels at a chosen resolution (kitty graphics protocol or sixel).
+    Graphics,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RendererChoice {
+    Auto,
     Kitty,
+    Sixel,
+    Blocks,
 }
 
 struct Config {
     fps: u32,
     res: usize,
-    renderer: Option<Renderer>,
+    renderer: RendererChoice,
     max_width: u16,
     sync: bool,
     volume: f32,
@@ -133,7 +145,7 @@ fn parse_args() -> Result<Config> {
     let mut cfg = Config {
         fps: 30,
         res: DEFAULT_RES,
-        renderer: None,
+        renderer: RendererChoice::Auto,
         max_width: 200,
         sync: true,
         volume: 0.8,
@@ -167,10 +179,11 @@ fn parse_args() -> Result<Config> {
             }
             "--renderer" => {
                 cfg.renderer = match args.next().context("--renderer needs a value")?.as_str() {
-                    "auto" => None,
-                    "kitty" => Some(Renderer::Kitty),
-                    "blocks" => Some(Renderer::Blocks),
-                    other => bail!("unknown renderer `{other}` (auto, kitty, blocks)"),
+                    "auto" => RendererChoice::Auto,
+                    "kitty" => RendererChoice::Kitty,
+                    "sixel" => RendererChoice::Sixel,
+                    "blocks" => RendererChoice::Blocks,
+                    other => bail!("unknown renderer `{other}` (auto, kitty, sixel, blocks)"),
                 }
             }
             "--no-sync" => cfg.sync = false,
@@ -422,6 +435,8 @@ pub struct App {
     /// What's shown: the effects output, on a backdrop canvas when `fill` is on.
     pub frame_out: Vec<u8>,
     pub frame_dims: (usize, usize),
+    /// Bumped whenever `frame_out` changes, so an unchanged frame isn't sent again.
+    frame_gen: u64,
     fx_out: Vec<u8>,
     /// While paused: what the shown frame was made from. Effects only run again when
     /// this changes (a seek, another effect set, a resize), not on every tick.
@@ -434,11 +449,13 @@ pub struct App {
     /// Latest detected crop and how many detections in a row agreed with it.
     crop_vote: (effects::Crop, u32),
     pub renderer: Renderer,
-    /// Present when the terminal supports the kitty graphics protocol.
-    kitty: Option<Kitty>,
+    /// Present when the terminal can show pixel graphics (kitty protocol or sixel).
+    graphics: Option<Graphics>,
     pub res: usize,
     /// Cell height / width in pixels, used to keep the picture's aspect ratio.
     pub cell_aspect: f64,
+    /// Cell width and height in pixels, when the terminal reports them.
+    cell_px: (u16, u16),
     /// Where ui::draw placed the video this frame (graphics renderer only).
     pub image_rect: Option<Rect>,
     /// Preview pane next to the browser lists (when the terminal is wide enough).
@@ -460,17 +477,13 @@ pub struct App {
 }
 
 impl App {
-    fn new(cfg: Config, audio: AudioOut, signed_in: Option<String>) -> Self {
+    fn new(
+        cfg: Config,
+        audio: AudioOut,
+        signed_in: Option<String>,
+        graphics: Option<Graphics>,
+    ) -> Self {
         let analyzer = Analyzer::new(audio.rate);
-        let transport = Kitty::detect();
-        let kitty = match cfg.renderer {
-            Some(Renderer::Blocks) => None,
-            // Forced on: trust the user even if detection didn't recognise the terminal.
-            Some(Renderer::Kitty) => {
-                Some(Kitty::new(transport.unwrap_or(kitty::Transport::Direct)))
-            }
-            None => transport.map(Kitty::new),
-        };
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0x2545_f491_4f6c_dd1d, |d| d.as_nanos() as u64);
@@ -529,20 +542,22 @@ impl App {
             freq_drag: None,
             frame_out: Vec::new(),
             frame_dims: (0, 0),
+            frame_gen: 0,
             fx_out: Vec::new(),
             paused_key: None,
             backdrop: Backdrop::default(),
             fill: true,
             crop: None,
             crop_vote: ((0, 0, 0, 0), 0),
-            renderer: if kitty.is_some() {
-                Renderer::Kitty
+            renderer: if graphics.is_some() {
+                Renderer::Graphics
             } else {
                 Renderer::Blocks
             },
-            kitty,
+            graphics,
             res: cfg.res,
             cell_aspect: 2.0,
+            cell_px: (0, 0),
             image_rect: None,
             show_preview: true,
             thumbs: preview::Thumbs::default(),
@@ -756,7 +771,7 @@ impl App {
     fn max_height(&self) -> usize {
         // Fetch a source at least as sharp as what we'll show.
         match self.renderer {
-            Renderer::Kitty => RES_STEPS[self.res].max(720),
+            Renderer::Graphics => RES_STEPS[self.res].max(720),
             Renderer::Blocks => 480,
         }
     }
@@ -1224,7 +1239,7 @@ impl App {
                 let mut h = DefaultHasher::new();
                 (f.pts.to_bits(), f.w, f.h, self.effects.enabled()).hash(&mut h);
                 (self.effects.intensity.to_bits(), self.fill, self.crop, area).hash(&mut h);
-                (self.renderer == Renderer::Kitty, self.open_menu()).hash(&mut h);
+                (self.renderer == Renderer::Graphics, self.open_menu()).hash(&mut h);
                 self.cell_aspect.to_bits().hash(&mut h);
                 // Keep rendering until the last hit has faded out, then hold still.
                 ((self.drive.pulse * 20.0) as u32).hash(&mut h);
@@ -1272,6 +1287,7 @@ impl App {
                     self.frame_dims = (f.w, f.h);
                 }
             }
+            self.frame_gen += 1;
         }
     }
 
@@ -1337,7 +1353,7 @@ impl App {
         let (cw, ch) = match self.renderer {
             // One cell is one pixel wide and two tall.
             Renderer::Blocks => (video.width as usize, video.height as usize * 2),
-            Renderer::Kitty => {
+            Renderer::Graphics => {
                 // Area aspect in pixels; grow the frame to it in one direction.
                 let aspect = video.width as f64 / (video.height as f64 * self.cell_aspect);
                 if aspect > fw as f64 / fh as f64 {
@@ -1416,7 +1432,7 @@ impl App {
                 aspect,
                 self.cfg.max_width,
             ),
-            Renderer::Kitty => {
+            Renderer::Graphics => {
                 let h = RES_STEPS[self.res];
                 (((h as f64 * aspect) as usize).max(2) & !1, h)
             }
@@ -1441,18 +1457,23 @@ impl App {
     }
 
     fn toggle_renderer(&mut self) {
-        if self.kitty.is_none() {
+        if self.graphics.is_none() {
             self.status = Some((
-                "this terminal doesn't support the kitty graphics protocol".into(),
+                "this terminal shows no pixel graphics (neither the kitty protocol nor sixel)"
+                    .into(),
                 false,
             ));
             return;
         }
         self.renderer = match self.renderer {
-            Renderer::Kitty => Renderer::Blocks,
-            Renderer::Blocks => Renderer::Kitty,
+            Renderer::Graphics => Renderer::Blocks,
+            Renderer::Blocks => Renderer::Graphics,
         };
         self.resize_at = Some(Instant::now());
+    }
+
+    pub fn graphics_name(&self) -> &'static str {
+        self.graphics.as_ref().map_or("", Graphics::name)
     }
 
     /// Sync off: effects sit at a steady base level with random hits now and then.
@@ -2144,6 +2165,7 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
             let cell_w = ws.width as f64 / ws.columns as f64;
             let cell_h = ws.height as f64 / ws.rows as f64;
             app.cell_aspect = (cell_h / cell_w).clamp(1.0, 4.0);
+            app.cell_px = (ws.width / ws.columns, ws.height / ws.rows);
         }
         app.tick(dt, Rect::new(0, 0, size.width, size.height));
 
@@ -2158,11 +2180,15 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
         // the rest of their row, and those cells would never be cleaned up. Whenever the
         // layout changes, repaint everything (inside the synchronized update: no flicker).
         let layout = app.layout_signature();
-        if layout != last_layout {
+        let wipe = app
+            .graphics
+            .as_ref()
+            .is_some_and(|g| g.needs_wipe(image_target(app).map(|t| t.0)));
+        if layout != last_layout || wipe {
             last_layout = layout;
             term.clear()?;
-            if let Some(k) = app.kitty.as_mut() {
-                k.forget();
+            if let Some(g) = app.graphics.as_mut() {
+                g.forget();
             }
             app.image_rect = None;
             app.preview_want = None;
@@ -2200,29 +2226,65 @@ fn run(term: &mut Term, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// What the graphics renderer shows this frame: where, and whether it is the video
+/// (`None`) or a preview thumbnail.
+fn image_target(app: &App) -> Option<(Rect, Option<&preview::Thumb>)> {
+    let (w, h) = app.frame_dims;
+    if let Some(rect) = app.image_rect
+        && w > 0
+        && app.frame_out.len() >= w * h * 3
+    {
+        return Some((rect, None));
+    }
+    if app.image_rect.is_some() {
+        return None;
+    }
+    let (rect, url) = app.preview_image.as_ref()?;
+    match app.thumbs.get(url) {
+        Some(preview::Slot::Ready(t)) => Some((*rect, Some(t))),
+        _ => None,
+    }
+}
+
 /// Graphics renderer: put the processed frame (or the preview thumbnail) where ui::draw
 /// left room for it.
 fn draw_image(term: &mut Term, app: &mut App) -> Result<()> {
-    let Some(kitty) = app.kitty.as_mut() else {
+    let Some(mut graphics) = app.graphics.take() else {
         return Ok(());
     };
     let out = term.backend_mut();
-    let (w, h) = app.frame_dims;
-    let thumb = app
-        .preview_image
-        .as_ref()
-        .and_then(|(rect, url)| match app.thumbs.get(url) {
-            Some(preview::Slot::Ready(t)) => Some((*rect, t)),
-            _ => None,
-        });
-    match (app.image_rect, thumb) {
-        (Some(rect), _) if w > 0 && app.frame_out.len() >= w * h * 3 => {
-            kitty.draw(out, rect, &app.frame_out, w, h)?
-        }
-        (None, Some((rect, t))) => kitty.draw_still(out, rect, &t.data, (t.w, t.h), t.id)?,
-        _ => kitty.clear(out)?,
+    let cell = app.cell_px;
+    let result = match image_target(app) {
+        Some((rect, None)) => graphics.draw(
+            out,
+            rect,
+            &app.frame_out,
+            app.frame_dims,
+            cell,
+            app.frame_gen,
+        ),
+        Some((rect, Some(t))) => graphics.draw_still(out, rect, &t.data, (t.w, t.h), cell, t.id),
+        None => graphics.clear(out),
+    };
+    app.graphics = Some(graphics);
+    Ok(result?)
+}
+
+/// The graphics renderer for this terminal, if any. Runs in raw mode, before input is read.
+fn pick_graphics(choice: RendererChoice) -> Option<Graphics> {
+    let transport = Kitty::detect();
+    match choice {
+        RendererChoice::Blocks => None,
+        // Forced on: trust the user even if detection didn't recognise the terminal.
+        RendererChoice::Kitty => Some(Graphics::Kitty(Kitty::new(
+            transport.unwrap_or(kitty::Transport::Direct),
+        ))),
+        RendererChoice::Sixel => Some(Graphics::Sixel(Sixel::new())),
+        RendererChoice::Auto => match transport {
+            Some(t) => Some(Graphics::Kitty(Kitty::new(t))),
+            None => sixel::probe().then(|| Graphics::Sixel(Sixel::new())),
+        },
     }
-    Ok(())
 }
 
 fn setup_terminal() -> Result<Term> {
@@ -2282,14 +2344,15 @@ fn main() -> Result<()> {
     let audio = AudioOut::open()?;
     audio.shared.set_volume(cfg.volume);
 
-    let mut app = App::new(cfg, audio, signed_in);
+    let mut term = setup_terminal()?;
+    let graphics = pick_graphics(cfg.renderer);
+    let mut app = App::new(cfg, audio, signed_in, graphics);
     if startup_error.is_some() {
         app.status = startup_error;
     }
-    let mut term = setup_terminal()?;
     let result = run(&mut term, &mut app);
-    if let Some(k) = app.kitty.as_mut() {
-        let _ = k.clear(term.backend_mut());
+    if let Some(g) = app.graphics.as_mut() {
+        let _ = g.clear(term.backend_mut());
         let _ = std::io::Write::flush(term.backend_mut());
     }
     drop(app);

@@ -619,7 +619,7 @@ fn draw_thumbnail(f: &mut Frame, app: &mut App, e: &Entry, rect: Rect, size: (us
     }
     let placeholder = match url.as_deref().map(|u| (u, app.thumbs.get(u))) {
         Some((url, Some(Slot::Ready(t)))) => {
-            if app.renderer == Renderer::Kitty {
+            if app.renderer == Renderer::Graphics {
                 app.preview_image = Some((rect, url.to_string()));
             } else {
                 let (w, h) = (rect.width as usize, rect.height as usize * 2);
@@ -769,7 +769,7 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     let video = video_area(area, app.open_menu());
     let (fw, fh) = app.frame_dims;
     let have_frame = fw > 0 && app.frame_out.len() >= fw * fh * 3;
-    if have_frame && app.renderer == Renderer::Kitty {
+    if have_frame && app.renderer == Renderer::Graphics {
         // Leave the cells empty; main draws the image here after ratatui is done.
         // Overlays hide it, since the image would cover their background.
         if !app.show_help && app.busy.is_none() && app.account_ui.is_none() {
@@ -1437,7 +1437,7 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::styled(
             match app.renderer {
-                Renderer::Kitty => format!("{}p ", RES_STEPS[app.res]),
+                Renderer::Graphics => format!("{}p {} ", RES_STEPS[app.res], app.graphics_name()),
                 Renderer::Blocks => format!("{}×{} blocks ", app.frame_dims.0, app.frame_dims.1),
             },
             Style::new().fg(Color::Gray),
