@@ -169,7 +169,7 @@ fn yt_dlp(target: &str) -> Result<(Command, Option<CookieCopy>)> {
     if is_youtube_target(target) {
         match auth {
             Some(Auth::Browser(b)) => {
-                cmd.arg("--cookies-from-browser").arg(b);
+                cmd.arg("--cookies-from-browser").arg(browser_spec(&b));
             }
             Some(Auth::CookiesFile(src)) => {
                 let c = CookieCopy::new(&src)?;
@@ -180,6 +180,67 @@ fn yt_dlp(target: &str) -> Result<(Command, Option<CookieCopy>)> {
         }
     }
     Ok((cmd, copy))
+}
+
+/// yt-dlp's `--cookies-from-browser` value (`BROWSER[+KEYRING][:PROFILE]`) for `browser`.
+/// On Linux, yt-dlp guesses the keyring from the desktop and picks the basic store on
+/// Hyprland, Sway and other window managers. A Chromium browser started with
+/// `--password-store=…` in its flags file (Omarchy sets gnome-libsecret) encrypts its
+/// cookies with that keyring instead, and yt-dlp then decrypts none of them.
+fn browser_spec(browser: &str) -> String {
+    let (name, rest) = browser.split_at(browser.find(':').unwrap_or(browser.len()));
+    if !cfg!(target_os = "linux") || name.contains('+') {
+        return browser.into();
+    }
+    let flags = |file: &str| {
+        crate::account::xdg_config_home()
+            .ok()
+            .and_then(|dir| fs::read_to_string(dir.join(file)).ok())
+    };
+    let files: &[&str] = match name {
+        "chromium" => &["chromium-flags.conf"],
+        "chrome" => &["chrome-flags.conf", "google-chrome-flags.conf"],
+        "brave" => &["brave-flags.conf", "brave-browser-flags.conf"],
+        "edge" => &["microsoft-edge-stable-flags.conf"],
+        "vivaldi" => &["vivaldi-stable.conf"],
+        _ => &[],
+    };
+    let store = files.iter().filter_map(|f| flags(f)).find_map(|t| password_store(&t));
+    let keyring = match store.as_deref() {
+        Some("gnome-libsecret" | "gnome-keyring" | "gnome") => "gnomekeyring",
+        Some("kwallet") => "kwallet",
+        Some("kwallet5") => "kwallet5",
+        Some("kwallet6") => "kwallet6",
+        Some("basic") => "basictext",
+        _ => return browser.into(),
+    };
+    format!("{name}+{keyring}{rest}")
+}
+
+/// The `--password-store=` value in a Chromium flags file.
+fn password_store(flags: &str) -> Option<String> {
+    flags
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .find_map(|w| w.strip_prefix("--password-store="))
+        .map(|v| v.trim_matches(['"', '\'']).to_string())
+}
+
+/// A clearer message when yt-dlp could not read the browser's cookies, which it otherwise
+/// only reports as a missing sign-in.
+fn cookie_read_error(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("secretstorage not available") {
+        return Some(
+            "yt-dlp needs the Python `secretstorage` module to read the browser's cookies from \
+             the GNOME keyring: install python-secretstorage (Arch) or python3-secretstorage \
+             (Debian/Ubuntu)",
+        );
+    }
+    (stderr.contains("cannot decrypt") || stderr.contains("failed to decrypt")).then_some(
+        "yt-dlp could not decrypt the browser's cookies (wrong keyring?). Name it with \
+         --cookies-from-browser, e.g. chromium+gnomekeyring or chrome+kwallet6",
+    )
 }
 
 /// A yt-dlp search or feed keyword, or an http(s) URL on a YouTube host.
@@ -560,6 +621,9 @@ fn list_once(target: &str, limit: usize) -> Result<Vec<Entry>> {
     if entries.is_empty() {
         // Warnings are kept on for this: an empty feed is otherwise all yt-dlp says.
         let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Some(msg) = cookie_read_error(&stderr) {
+            bail!("{msg}");
+        }
         if stderr.contains("cookies are no longer valid") {
             bail!("{COOKIES_ROTATED}");
         }
@@ -621,6 +685,9 @@ pub fn resolve(url: &str, max_height: usize) -> Result<StreamInfo> {
         .output()
         .context("could not run yt-dlp (is it installed and on PATH?)")?;
     if !out.status.success() {
+        if let Some(msg) = cookie_read_error(&String::from_utf8_lossy(&out.stderr)) {
+            bail!("{msg}");
+        }
         let err = last_line(&out.stderr);
         if err.contains("not a bot") {
             bail!(
@@ -846,6 +913,17 @@ mod tests {
         );
         let normal = "https://www.youtube.com/playlist?list=PLGBKsNyGY-afUo7nfXwctjuJgCtqrYI6Q";
         assert_eq!(list_url(normal), normal);
+    }
+
+    #[test]
+    fn reads_chromium_password_store() {
+        let flags = "--ozone-platform=wayland\n# --password-store=basic\n--password-store=gnome-libsecret\n";
+        assert_eq!(password_store(flags).as_deref(), Some("gnome-libsecret"));
+        assert_eq!(password_store("--no-default-browser-check\n"), None);
+        assert_eq!(browser_spec("firefox"), "firefox");
+        assert_eq!(browser_spec("chromium+kwallet6:Profile 1"), "chromium+kwallet6:Profile 1");
+        assert!(cookie_read_error("WARNING: cannot decrypt v11 cookies: no key found").is_some());
+        assert!(cookie_read_error("ERROR: Login details are needed").is_none());
     }
 
     #[test]

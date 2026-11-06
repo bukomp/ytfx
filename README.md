@@ -167,7 +167,7 @@ Press `L` to open the account dialog. Sign-in persists across runs.
 A `cookies.txt` in `~/.config/ytfx/` (or `$XDG_CONFIG_HOME/ytfx/`) is used automatically at startup, also when you copy it there by hand. ytfx removes the lines for sites other than youtube.com and sets the mode to 0600. If the file has no youtube.com sign-in, ytfx starts signed out and shows the reason. A browser chosen with `b` takes priority over the file.
 
 - `f`: import a `cookies.txt` file. Export it from a youtube.com tab with a browser extension (for example "Get cookies.txt LOCALLY"). ytfx keeps only the youtube.com cookies, in `~/.config/ytfx/cookies.txt` (or `$XDG_CONFIG_HOME/ytfx`) with mode 0600. You can delete the exported file afterwards.
-- `b`: let yt-dlp read a browser's cookie store (firefox, chrome, chromium, edge, brave, safari, vivaldi, opera). On macOS, Chromium browsers ask for Keychain access. Safari needs Full Disk Access for the terminal. Firefox needs neither.
+- `b`: let yt-dlp read a browser's cookie store (firefox, chrome, chromium, edge, brave, safari, vivaldi, opera). On macOS, Chromium browsers ask for Keychain access. Safari needs Full Disk Access for the terminal. Firefox needs neither. On Linux, Chromium browsers keep the cookie key in the GNOME keyring or KWallet. ytfx reads `--password-store=` from the browser's flags file (for example `~/.config/chromium-flags.conf`) and passes that keyring to yt-dlp. The GNOME keyring needs the Python `secretstorage` module (`python-secretstorage` on Arch).
 - `o`: sign out and delete the imported cookies.
 
 ytfx never reads browser data unless you pick `b`.
