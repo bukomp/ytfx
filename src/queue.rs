@@ -109,15 +109,17 @@ impl Queue {
         self.items.push(entry);
     }
 
-    /// Remove an item other than the current one.
-    pub fn remove(&mut self, i: usize) -> bool {
-        if i >= self.items.len() || i == self.pos {
+    /// Remove an item. The current one can go only while nothing is `playing`; the
+    /// position then moves to the video after it (or the new last one).
+    pub fn remove(&mut self, i: usize, playing: bool) -> bool {
+        if i >= self.items.len() || (playing && i == self.pos) {
             return false;
         }
         self.items.remove(i);
         if i < self.pos {
             self.pos -= 1;
         }
+        self.pos = self.pos.min(self.items.len().saturating_sub(1));
         true
     }
 
@@ -202,9 +204,20 @@ mod tests {
     fn remove_keeps_the_current_item() {
         let mut q = Queue::default();
         q.set(&["a", "b", "c"].map(video), 1);
-        assert!(!q.remove(1));
-        assert!(q.remove(0));
+        assert!(!q.remove(1, true));
+        assert!(q.remove(0, true));
         assert_eq!(q.current().unwrap().target, "b");
         assert_eq!(q.remaining(), 1);
+    }
+
+    #[test]
+    fn remove_takes_the_current_item_when_idle() {
+        let mut q = Queue::default();
+        q.set(&["a", "b"].map(video), 0);
+        assert!(q.remove(0, false));
+        assert_eq!(q.current().unwrap().target, "b");
+        assert!(q.remove(0, false));
+        assert!(q.items.is_empty());
+        assert_eq!(q.pos, 0);
     }
 }

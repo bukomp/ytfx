@@ -1597,7 +1597,7 @@ impl App {
             KeyCode::Char('a') => self.enqueue(),
             KeyCode::Char('x') | KeyCode::Delete if self.tab == Tab::Queue => {
                 if let Some(i) = self.queue_state.selected()
-                    && !self.queue.remove(i)
+                    && !self.queue.remove(i, self.active)
                 {
                     self.status = Some(("can't remove the playing video".into(), false));
                 }
