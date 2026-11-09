@@ -26,16 +26,22 @@ const PREVIEW_MIN_WIDTH: u16 = 90;
 /// Width of the effects side menu.
 const FX_MENU_WIDTH: u16 = 34;
 
-/// The part of the screen the video may use: everything above the HUD, left of the
-/// effects menu or above the frequency panel when one is open.
-pub fn video_area(area: Rect, menu: Option<FxPage>) -> Rect {
+/// Rows the HUD takes at the bottom of the player: none while it's hidden.
+fn hud_rows(hud: bool) -> u16 {
+    if hud { HUD_HEIGHT } else { 0 }
+}
+
+/// The part of the screen the video may use: everything above the HUD (all of it while
+/// the HUD is hidden), left of the effects menu or above the frequency panel when one is
+/// open.
+pub fn video_area(area: Rect, menu: Option<FxPage>, hud: bool) -> Rect {
     let mut video = Rect {
-        height: area.height.saturating_sub(HUD_HEIGHT),
+        height: area.height.saturating_sub(hud_rows(hud)),
         ..area
     };
     match menu {
-        Some(FxPage::Effects) => video.width -= fx_menu_area(area).width,
-        Some(FxPage::Freq) => video.height -= freq_panel_area(area).height,
+        Some(FxPage::Effects) => video.width -= fx_menu_area(area, hud).width,
+        Some(FxPage::Freq) => video.height -= freq_panel_area(area, hud).height,
         None => {}
     }
     video
@@ -43,8 +49,8 @@ pub fn video_area(area: Rect, menu: Option<FxPage>) -> Rect {
 
 /// Where the frequency panel goes: the full width, right above the HUD. About half the
 /// screen, so the columns are tall, but the video keeps a few rows.
-fn freq_panel_area(area: Rect) -> Rect {
-    let room = area.height.saturating_sub(HUD_HEIGHT);
+fn freq_panel_area(area: Rect, hud: bool) -> Rect {
+    let room = area.height.saturating_sub(hud_rows(hud));
     let height = (room / 2).clamp(14, 30).min(room.saturating_sub(4));
     Rect {
         y: area.y + room - height,
@@ -54,12 +60,12 @@ fn freq_panel_area(area: Rect) -> Rect {
 }
 
 /// Where the effects menu goes: the right edge, above the HUD.
-fn fx_menu_area(area: Rect) -> Rect {
+fn fx_menu_area(area: Rect, hud: bool) -> Rect {
     let width = FX_MENU_WIDTH.min(area.width / 2);
     Rect {
         x: area.right() - width,
         width,
-        height: area.height.saturating_sub(HUD_HEIGHT),
+        height: area.height.saturating_sub(hud_rows(hud)),
         ..area
     }
 }
@@ -780,7 +786,7 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
 
-    let video = video_area(area, app.open_menu());
+    let video = video_area(area, app.open_menu(), app.show_hud);
     let (fw, fh) = app.frame_dims;
     let have_frame = fw > 0 && app.frame_out.len() >= fw * fh * 3;
     if have_frame && app.renderer == Renderer::Graphics {
@@ -825,8 +831,8 @@ fn draw_player(f: &mut Frame, app: &mut App) {
     }
 
     match app.open_menu() {
-        Some(FxPage::Effects) => draw_fx_menu(f, app, fx_menu_area(area)),
-        Some(FxPage::Freq) => draw_freq_panel(f, app, freq_panel_area(area)),
+        Some(FxPage::Effects) => draw_fx_menu(f, app, fx_menu_area(area, app.show_hud)),
+        Some(FxPage::Freq) => draw_freq_panel(f, app, freq_panel_area(area, app.show_hud)),
         None => {}
     }
 

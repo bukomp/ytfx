@@ -1359,7 +1359,7 @@ impl App {
         fh: usize,
         crop: effects::Crop,
     ) -> Option<(usize, usize)> {
-        let video = ui::video_area(area, self.open_menu());
+        let video = ui::video_area(area, self.open_menu(), self.show_hud);
         if !self.fill || video.width == 0 || video.height == 0 {
             return None;
         }
@@ -1441,7 +1441,7 @@ impl App {
     fn decode_size(&self, area: Rect, aspect: f64) -> (usize, usize) {
         match self.renderer {
             Renderer::Blocks => ui::fit(
-                ui::video_area(area, self.open_menu()),
+                ui::video_area(area, self.open_menu(), self.show_hud),
                 aspect,
                 self.cfg.max_width,
             ),
@@ -2123,6 +2123,7 @@ impl App {
         (
             self.busy.is_some(),
             self.show_help,
+            self.show_hud,
             self.open_menu(),
             self.account_ui.is_some(),
             &self.status,
