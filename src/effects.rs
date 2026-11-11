@@ -1975,6 +1975,8 @@ pub fn content_rect(frame: &[u8], w: usize, h: usize) -> Crop {
 
 /// Checks before a crop is used at all.
 const CROP_SAMPLES: u32 = 3;
+/// Sides with bars are cropped 1/CROP_PAD_DIV of the frame further in.
+const CROP_PAD_DIV: usize = 100;
 
 /// Follows the black bars of one video over many frames. Baked-in bars never change, but
 /// the picture between them is sometimes dark at the edges, so the crop is the union of
@@ -2006,11 +2008,23 @@ impl BarTracker {
     }
 
     /// The picture area to use for a w x h frame (the whole frame until there is one).
+    /// Sides with bars are moved in a little, so the soft edge between a bar and the
+    /// picture (and any compression smear) stays out.
     pub fn crop(&self, w: usize, h: usize) -> Crop {
-        match self.seen {
-            Some((c, dims)) if self.samples >= CROP_SAMPLES => scale_crop(c, dims, (w, h)),
-            _ => (0, 0, w, h),
-        }
+        let Some((c, dims)) = self.seen.filter(|_| self.samples >= CROP_SAMPLES) else {
+            return (0, 0, w, h);
+        };
+        let (x0, y0, x1, y1) = scale_crop(c, dims, (w, h));
+        let (px, py) = ((w / CROP_PAD_DIV).max(1), (h / CROP_PAD_DIV).max(1));
+        let pad = |a: usize, b: usize, len: usize, p: usize| {
+            let pa = if a > 0 { a + p } else { a };
+            let pb = if b < len { b.saturating_sub(p) } else { b };
+            // Never pad a picture away.
+            if pb > pa { (pa, pb) } else { (a, b) }
+        };
+        let (x0, x1) = pad(x0, x1, w, px);
+        let (y0, y1) = pad(y0, y1, h, py);
+        (x0, y0, x1, y1)
     }
 }
 
@@ -2037,6 +2051,8 @@ const BACKDROP_MIN: usize = 32;
 const BACKDROP_ZOOM: f32 = 1.5;
 /// Brightness of the backdrop, of 256.
 const BACKDROP_LIGHT: u32 = 150;
+/// The picture fades into the backdrop over 1/FEATHER_DIV of its smaller side.
+const FEATHER_DIV: usize = 32;
 
 impl Backdrop {
     /// Put `frame` (fw x fh) in the middle of a cw x ch canvas written to `out`. Only the
@@ -2095,29 +2111,63 @@ impl Backdrop {
         // Canvas position of the content.
         let (ox, oy) = ((cw - fw.min(cw)) / 2 + x0, (ch - fh.min(ch)) / 2 + y0);
         let (pw, ph) = (x1 - x0, y1 - y0);
+        // Edges of the picture that meet the backdrop fade into it; edges on the canvas
+        // border stay sharp. The weights are per column and per row, of 256.
+        let feather = (pw.min(ph) / FEATHER_DIV).max(1);
+        let ramp = |len: usize, near: bool, far: bool| -> Vec<u32> {
+            (0..len)
+                .map(|i| {
+                    let edge = |d: usize, on: bool| {
+                        if !on || d >= feather {
+                            return 256;
+                        }
+                        let t = (d as f32 + 0.5) / feather as f32;
+                        (t * t * (3.0 - 2.0 * t) * 256.0) as u32
+                    };
+                    edge(i, near).min(edge(len - 1 - i, far))
+                })
+                .collect()
+        };
+        let ax = ramp(pw, ox > 0, ox + pw < cw);
+        let ay = ramp(ph, oy > 0, oy + ph < ch);
         let row = cw * 3;
         for (y, dst) in out.chunks_exact_mut(row).enumerate() {
             let in_video = y >= oy && y < oy + ph;
             let (a, b, wy) = ys[y];
             let (ra, rb) = (&self.small[a * sw * 3..], &self.small[b * sw * 3..]);
+            let back = |x: usize, c: usize| {
+                let (xa, xb, wx) = xs[x];
+                let top = ra[xa * 3 + c] as u32 * (256 - wx) + ra[xb * 3 + c] as u32 * wx;
+                let bot = rb[xa * 3 + c] as u32 * (256 - wx) + rb[xb * 3 + c] as u32 * wx;
+                (top * (256 - wy) + bot * wy) >> 16
+            };
             let mut fill = |from: usize, to: usize| {
                 for x in from..to {
-                    let (xa, xb, wx) = xs[x];
                     for c in 0..3 {
-                        let top = ra[xa * 3 + c] as u32 * (256 - wx) + ra[xb * 3 + c] as u32 * wx;
-                        let bot = rb[xa * 3 + c] as u32 * (256 - wx) + rb[xb * 3 + c] as u32 * wx;
-                        dst[x * 3 + c] = ((top * (256 - wy) + bot * wy) >> 16) as u8;
+                        dst[x * 3 + c] = back(x, c) as u8;
                     }
                 }
             };
-            if in_video {
-                fill(0, ox);
-                fill(ox + pw, cw);
-                let fy = y - oy + y0;
-                let src = &frame[(fy * fw + x0) * 3..(fy * fw + x1) * 3];
-                dst[ox * 3..(ox + pw) * 3].copy_from_slice(src);
-            } else {
+            if !in_video {
                 fill(0, cw);
+                continue;
+            }
+            fill(0, ox);
+            fill(ox + pw, cw);
+            let fy = y - oy + y0;
+            let src = &frame[(fy * fw + x0) * 3..(fy * fw + x1) * 3];
+            dst[ox * 3..(ox + pw) * 3].copy_from_slice(src);
+            let wy_row = ay[y - oy];
+            for (i, &wx) in ax.iter().enumerate() {
+                let w = wx.min(wy_row);
+                if w >= 256 {
+                    continue;
+                }
+                let x = ox + i;
+                for c in 0..3 {
+                    let v = &mut dst[x * 3 + c];
+                    *v = ((*v as u32 * w + back(x, c) * (256 - w)) >> 8) as u8;
+                }
             }
         }
     }
@@ -2235,11 +2285,15 @@ mod tests {
         b.compose(&frame, fw, fh, (0, 0, fw, fh), cw, ch, &mut out);
         assert_eq!(out.len(), cw * ch * 3);
         let ox = (cw - fw) / 2;
+        // Inside the picture is untouched; the side edges (which meet the backdrop) are
+        // blended into it, the top and bottom (on the canvas border) are not.
         for y in 0..fh {
             assert_eq!(
-                &out[(y * cw + ox) * 3..(y * cw + ox + fw) * 3],
-                &frame[y * fw * 3..(y + 1) * fw * 3]
+                &out[(y * cw + ox + 1) * 3..(y * cw + ox + fw - 1) * 3],
+                &frame[(y * fw + 1) * 3..((y + 1) * fw - 1) * 3]
             );
+            let (edge, src) = ((y * cw + ox) * 3, y * fw * 3);
+            assert_ne!(&out[edge..edge + 3], &frame[src..src + 3]);
         }
         // The bars are filled, and darker than the picture.
         let bar: u32 = out[..ox * 3].iter().map(|&v| v as u32).sum();
@@ -2247,12 +2301,14 @@ mod tests {
         // Odd sizes and a canvas taller than the frame.
         b.compose(&frame, fw, fh, (0, 0, fw, fh), 41, 77, &mut out);
         b.compose(&frame[..3], 1, 1, (0, 0, 1, 1), 9, 9, &mut out);
-        // Baked-in bars: only the content rows are copied, the bars get the backdrop.
+        // Baked-in bars: only the content rows are copied (their first and last rows
+        // fade into the backdrop), the bars get the backdrop.
         b.compose(&frame, fw, fh, (0, 5, fw, 25), fw, fh, &mut out);
         assert_eq!(
-            &out[5 * fw * 3..25 * fw * 3],
-            &frame[5 * fw * 3..25 * fw * 3]
+            &out[6 * fw * 3..24 * fw * 3],
+            &frame[6 * fw * 3..24 * fw * 3]
         );
+        assert_ne!(&out[5 * fw * 3..6 * fw * 3], &frame[5 * fw * 3..6 * fw * 3]);
     }
 
     #[test]
@@ -2291,6 +2347,16 @@ mod tests {
     }
 
     #[test]
+    fn crop_padding_never_removes_the_picture() {
+        let mut t = BarTracker::default();
+        // A 2-row picture between huge bars is left as found, not padded away.
+        let (w, h) = (16, 300);
+        t.seen = Some(((0, 149, w, 151), (w, h)));
+        t.samples = CROP_SAMPLES;
+        assert_eq!(t.crop(w, h), (0, 149, w, 151));
+    }
+
+    #[test]
     fn bar_tracker_never_shrinks_the_picture() {
         let (w, h) = (160, 90);
         let mut t = BarTracker::default();
@@ -2299,16 +2365,16 @@ mod tests {
             assert_eq!(t.crop(w, h), (0, 0, w, h));
             t.observe(&bars, w, h);
         }
-        assert_eq!(t.crop(w, h), (0, 15, w, 75));
+        assert_eq!(t.crop(w, h), (0, 16, w, 74));
         // A dark scene with a bright middle doesn't cut the picture.
         for _ in 0..10 {
             t.observe(&lit_rows(w, h, 30..60), w, h);
         }
-        assert_eq!(t.crop(w, h), (0, 15, w, 75));
+        assert_eq!(t.crop(w, h), (0, 16, w, 74));
         // A bigger frame (after a resize) gets the same crop, scaled.
-        assert_eq!(t.crop(320, 180), (0, 30, 320, 150));
+        assert_eq!(t.crop(320, 180), (0, 31, 320, 149));
         t.observe(&lit_rows(320, 180, 30..150), 320, 180);
-        assert_eq!(t.crop(w, h), (0, 15, w, 75));
+        assert_eq!(t.crop(w, h), (0, 16, w, 74));
         t.reset();
         assert_eq!(t.crop(w, h), (0, 0, w, h));
     }

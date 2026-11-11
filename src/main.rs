@@ -458,6 +458,8 @@ pub struct App {
     pub fill: bool,
     /// Picture area inside black bars baked into the video.
     bars: BarTracker,
+    /// The picture inside the bars, cut out of the decoded frame for the effects.
+    crop_buf: Vec<u8>,
     pub renderer: Renderer,
     /// Present when the terminal can show pixel graphics (kitty protocol or sixel).
     graphics: Option<Graphics>,
@@ -560,6 +562,7 @@ impl App {
             backdrop: Backdrop::default(),
             fill: true,
             bars: BarTracker::default(),
+            crop_buf: Vec::new(),
             renderer: if graphics.is_some() {
                 Renderer::Graphics
             } else {
@@ -1277,24 +1280,40 @@ impl App {
                 self.bars.observe(&f.data, f.w, f.h);
             }
             let crop = self.bars.crop(f.w, f.h);
+            let canvas = self.fill_canvas(area, f.w, f.h, crop);
+            // With the backdrop on, effects only see the picture inside the bars, so a
+            // shake or glitch never drags a black bar into view.
+            let (x0, y0, x1, y1) = crop;
+            let cropped =
+                canvas.is_some() && crop != (0, 0, f.w, f.h) && f.data.len() >= f.w * f.h * 3;
+            let (src, sw, sh) = if cropped {
+                self.crop_buf.clear();
+                for y in y0..y1 {
+                    self.crop_buf
+                        .extend_from_slice(&f.data[(y * f.w + x0) * 3..(y * f.w + x1) * 3]);
+                }
+                (&self.crop_buf[..], x1 - x0, y1 - y0)
+            } else {
+                (&f.data[..], f.w, f.h)
+            };
             if self.bypass {
                 self.fx_out.clear();
                 self.fx_out
-                    .extend_from_slice(&f.data[..(f.w * f.h * 3).min(f.data.len())]);
+                    .extend_from_slice(&src[..(sw * sh * 3).min(src.len())]);
             } else {
                 self.effects
-                    .render(&f.data, f.w, f.h, self.drive, dt, &mut self.fx_out);
+                    .render(src, sw, sh, self.drive, dt, &mut self.fx_out);
             }
             if let Some(why) = self.effects.gpu_failure() {
                 self.status = Some((format!("effects run on the CPU: {why}"), false));
             }
-            match self.fill_canvas(area, f.w, f.h, crop) {
+            match canvas {
                 Some((cw, ch)) => {
                     self.backdrop.compose(
                         &self.fx_out,
-                        f.w,
-                        f.h,
-                        crop,
+                        sw,
+                        sh,
+                        (0, 0, sw, sh),
                         cw,
                         ch,
                         &mut self.frame_out,
