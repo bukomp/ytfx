@@ -192,7 +192,7 @@ impl Fx {
             Fx::Edges => ("edges", "neon outlines on black"),
             Fx::Crt => ("crt", "scanlines and phosphor mask"),
             Fx::Film => ("film", "sepia, grain and scratches"),
-            Fx::Vhs => ("vhs", "tape wobble, tracking, grain"),
+            Fx::Vhs => ("vhs", "tape wobble, scanlines, grain"),
         }
     }
 }
@@ -869,23 +869,16 @@ impl Effects {
         (0..h).map(|_| self.rng.below(span) as u32).collect()
     }
 
-    /// Tape look: wobbling rows, a rolling tracking band, scanlines and grain.
+    /// Tape look: wobbling rows, scanlines and grain.
     fn vhs_plan(&mut self, w: usize, h: usize, p: f32, px: f32) -> Step {
         let (time, i) = (self.time, self.intensity);
-        let band = ((time * 0.23).fract() * h as f32) as isize;
-        let band_half = (3.0 * px) as isize;
         let span = self.noise.len() - w + 1;
         let rows = (0..h)
             .map(|y| {
-                let mut off = (time * 9.0 + y as f32 * 0.21 / px).sin() * (0.4 + 1.5 * p) * px;
-                let in_band = (y as isize - band).abs() < band_half;
-                if in_band {
-                    off += self.rng.signed() * 6.0 * i * px;
-                }
+                let off = (time * 9.0 + y as f32 * 0.21 / px).sin() * (0.4 + 1.5 * p) * px;
                 VhsRow {
                     off: off.round() as i32,
                     start: self.rng.below(span) as u32,
-                    lift: if in_band { 25 } else { 0 },
                 }
             })
             .collect();
@@ -1002,12 +995,10 @@ pub(crate) enum Step {
     Tone(Box<[u8; 256]>),
 }
 
-/// Per row of the VHS effect: its shift, its start in the grain table, and the extra
-/// brightness of the tracking band.
+/// Per row of the VHS effect: its shift and its start in the grain table.
 pub(crate) struct VhsRow {
     pub off: i32,
     pub start: u32,
-    pub lift: i32,
 }
 
 pub(crate) struct FilmPlan {
@@ -1883,13 +1874,13 @@ fn pixelate(out: &mut [u8], w: usize, h: usize, block: usize) {
     }
 }
 
-/// Tape look: wobbling rows, a rolling tracking band, scanlines and grain (see `VhsRow`).
+/// Tape look: wobbling rows, scanlines and grain (see `VhsRow`).
 fn vhs(out: &mut [u8], w: usize, line: usize, grain: i32, noise: &[i16], rows: &[VhsRow]) {
     for (y, (dst, r)) in out.chunks_exact_mut(w * 3).zip(rows).enumerate() {
         shift_row(dst, r.off as isize);
         let scan: i32 = if (y / line) % 2 == 1 { 210 } else { 256 };
         for (pxl, &n) in dst.chunks_exact_mut(3).zip(noise_row(noise, w, r.start)) {
-            let n = n as i32 * grain / 256 + r.lift;
+            let n = n as i32 * grain / 256;
             for v in pxl {
                 *v = (((*v as i32 * scan) >> 8) + n).clamp(0, 255) as u8;
             }

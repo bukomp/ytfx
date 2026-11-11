@@ -724,10 +724,7 @@ impl Chain {
                 self.then(Op::Dither, |p| (p.r, p.i[0]) = (*levels, *cell as i32));
             }
             Step::Vhs { line, grain, rows } => {
-                let data = self.put(
-                    rows.iter()
-                        .flat_map(|r: &VhsRow| [r.off as u32, r.start, r.lift as u32]),
-                );
+                let data = self.put(rows.iter().flat_map(|r: &VhsRow| [r.off as u32, r.start]));
                 self.then(Op::Vhs, |p| {
                     (p.data, p.r, p.i[0]) = (data, *line as u32, *grain)
                 });

@@ -172,7 +172,7 @@ Mouse: click a column in the level meters to select it, or drag across them to s
 | Glitch | rgb (chromatic aberration), glitch (datamosh), slice (bands slide apart), static (tv snow), swap (colour channels swap) |
 | Color | red (blood-red duotone), noir (black and white), thermal (heat camera), vapor (purple / cyan), hue (drifts, jumps on hits), poster (flat bands), solar (solarized highlights), invert (negative flash) |
 | Light | strobe (brightness pumps), flash (white flash), glow (bloom), vignette (dark edges pump), cinema (black bars slam in) |
-| Texture | blur (soft focus), pixel (chunky pixels), dither (ordered dither), edges (neon outlines), crt (scanlines, phosphor mask), film (sepia, grain, scratches), vhs (tape wobble, tracking, grain) |
+| Texture | blur (soft focus), pixel (chunky pixels), dither (ordered dither), edges (neon outlines), crt (scanlines, phosphor mask), film (sepia, grain, scratches), vhs (tape wobble, scanlines, grain) |
 
 ytfx remembers the enabled effects, preset, intensity, frequency sensitivity, audio delay, sync and background fill across runs, in `~/.config/ytfx/settings.json`. `--no-sync` still turns sync off for one run.
 

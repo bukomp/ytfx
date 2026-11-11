@@ -494,8 +494,8 @@ fn dither(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     st(p.dst, i, q * 255u / steps);
 }
 
-// `vhs`: scanlines every p.r rows, grain p.i0.x; at p.data, 3 words per row (shift,
-// start in the grain, lift).
+// `vhs`: scanlines every p.r rows, grain p.i0.x; at p.data, 2 words per row (shift,
+// start in the grain).
 @compute @workgroup_size(256)
 fn vhs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let i = item(gid, groups);
@@ -504,10 +504,10 @@ fn vhs(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) g
     }
     let x = i % p.w;
     let y = i / p.w;
-    let k = p.data + y * 3u;
+    let k = p.data + y * 2u;
     let c = vec3<i32>(at(p.src, i32(x) - bitcast<i32>(dat[k]), i32(y)));
     let scan = select(256, 210, (y / p.r) % 2u == 1u);
-    let n = grain(dat[k + 1u] + x) * p.i0.x / 256 + bitcast<i32>(dat[k + 2u]);
+    let n = grain(dat[k + 1u] + x) * p.i0.x / 256;
     sti(p.dst, i, clamp(((c * scan) >> vec3<u32>(8u)) + n, vec3<i32>(0), vec3<i32>(255)));
 }
 
