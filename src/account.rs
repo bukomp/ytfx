@@ -53,10 +53,14 @@ impl Account {
 
 /// `$XDG_CONFIG_HOME`, or `~/.config`.
 pub fn xdg_config_home() -> Result<PathBuf> {
-    Ok(match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config"),
-    })
+    Ok(
+        match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config")
+            }
+        },
+    )
 }
 
 pub fn config_dir() -> Result<PathBuf> {
