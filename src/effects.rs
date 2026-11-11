@@ -1952,20 +1952,82 @@ pub fn content_rect(frame: &[u8], w: usize, h: usize) -> Crop {
     };
     let left = (0..w).find(|&x| col_lit(x)).unwrap_or(0);
     let right = (0..w).rfind(|&x| col_lit(x)).map_or(w, |x| x + 1);
-    let (min_x, min_y) = (w / 50, h / 50);
-    let x0 = if left >= min_x { left } else { 0 };
-    let x1 = if w - right >= min_x { right } else { w };
-    let y0 = if top >= min_y { top } else { 0 };
-    let y1 = if h - (bottom + 1) >= min_y {
-        bottom + 1
-    } else {
-        h
+    // Baked-in bars are (nearly) the same size on both sides. A dark sky or floor only
+    // darkens one side, so when the two sides disagree, trust the smaller one for both.
+    let pair = |a: usize, b: usize, len: usize| {
+        let min = len / 50;
+        let (a, b) = (if a >= min { a } else { 0 }, if b >= min { b } else { 0 });
+        if a.abs_diff(b) <= len / 50 {
+            (a, b)
+        } else {
+            (a.min(b), a.min(b))
+        }
     };
+    let (l, r) = pair(left, w - right, w);
+    let (t, b) = pair(top, h - (bottom + 1), h);
+    let (x0, x1, y0, y1) = (l, w - r, t, h - b);
     // A tiny picture is more likely a dark scene with one bright spot than real bars.
     if (x1 - x0) * 4 < w || (y1 - y0) * 4 < h {
         return (0, 0, w, h);
     }
     (x0, y0, x1, y1)
+}
+
+/// Checks before a crop is used at all.
+const CROP_SAMPLES: u32 = 3;
+
+/// Follows the black bars of one video over many frames. Baked-in bars never change, but
+/// the picture between them is sometimes dark at the edges, so the crop is the union of
+/// every picture area seen: it can only grow, and a dark scene never cuts the picture.
+#[derive(Default)]
+pub struct BarTracker {
+    /// Union of the detected picture areas, in frames of size `dims`.
+    seen: Option<(Crop, (usize, usize))>,
+    samples: u32,
+}
+
+impl BarTracker {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Look for bars in one (clean) w x h frame.
+    pub fn observe(&mut self, frame: &[u8], w: usize, h: usize) {
+        if w == 0 || h == 0 || frame.len() < w * h * 3 {
+            return;
+        }
+        let (x0, y0, x1, y1) = content_rect(frame, w, h);
+        let old = self.seen.map(|(c, dims)| scale_crop(c, dims, (w, h)));
+        let union = old.map_or((x0, y0, x1, y1), |(a0, b0, a1, b1)| {
+            (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
+        });
+        self.seen = Some((union, (w, h)));
+        self.samples += 1;
+    }
+
+    /// The picture area to use for a w x h frame (the whole frame until there is one).
+    pub fn crop(&self, w: usize, h: usize) -> Crop {
+        match self.seen {
+            Some((c, dims)) if self.samples >= CROP_SAMPLES => scale_crop(c, dims, (w, h)),
+            _ => (0, 0, w, h),
+        }
+    }
+}
+
+/// `c` measured on a frame of size `from`, moved to a frame of size `to`. Rounds outward
+/// so the picture is never cut.
+fn scale_crop(c: Crop, from: (usize, usize), to: (usize, usize)) -> Crop {
+    if from == to {
+        return c;
+    }
+    let down = |v: usize, f: usize, t: usize| v * t / f;
+    let up = |v: usize, f: usize, t: usize| (v * t).div_ceil(f).min(t);
+    (
+        down(c.0, from.0, to.0),
+        down(c.1, from.1, to.1),
+        up(c.2, from.0, to.0),
+        up(c.3, from.1, to.1),
+    )
 }
 
 /// Backdrop resolution: 1/BACKDROP_SCALE of the canvas, but at least BACKDROP_MIN wide so
@@ -2207,6 +2269,48 @@ mod tests {
         assert_eq!(content_rect(&vec![0; w * h * 3], w, h), (0, 0, w, h));
         let full = vec![200; w * h * 3];
         assert_eq!(content_rect(&full, w, h), (0, 0, w, h));
+    }
+
+    /// A frame lit only in rows `lit`.
+    fn lit_rows(w: usize, h: usize, lit: std::ops::Range<usize>) -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| {
+                let v = if lit.contains(&(i / w)) { 120 } else { 6 };
+                [v, v, v]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dark_sky_is_not_a_bar() {
+        let (w, h) = (160, 90);
+        // Dark top third, lit below: one-sided, so not letterboxing.
+        assert_eq!(content_rect(&lit_rows(w, h, 30..90), w, h), (0, 0, w, h));
+        // Real bars plus a dark sky: only the bars go.
+        assert_eq!(content_rect(&lit_rows(w, h, 35..80), w, h), (0, 10, w, 80));
+    }
+
+    #[test]
+    fn bar_tracker_never_shrinks_the_picture() {
+        let (w, h) = (160, 90);
+        let mut t = BarTracker::default();
+        let bars = lit_rows(w, h, 15..75);
+        for _ in 0..CROP_SAMPLES {
+            assert_eq!(t.crop(w, h), (0, 0, w, h));
+            t.observe(&bars, w, h);
+        }
+        assert_eq!(t.crop(w, h), (0, 15, w, 75));
+        // A dark scene with a bright middle doesn't cut the picture.
+        for _ in 0..10 {
+            t.observe(&lit_rows(w, h, 30..60), w, h);
+        }
+        assert_eq!(t.crop(w, h), (0, 15, w, 75));
+        // A bigger frame (after a resize) gets the same crop, scaled.
+        assert_eq!(t.crop(320, 180), (0, 30, 320, 150));
+        t.observe(&lit_rows(320, 180, 30..150), 320, 180);
+        assert_eq!(t.crop(w, h), (0, 15, w, 75));
+        t.reset();
+        assert_eq!(t.crop(w, h), (0, 0, w, h));
     }
 
     /// The GPU runs every effect like the CPU does. Skipped when there is no GPU.

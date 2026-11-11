@@ -40,7 +40,7 @@ use ratatui::widgets::ListState;
 use account::Account;
 use analysis::{Analyzer, SLICE_HZ, SLICES};
 use audio::AudioOut;
-use effects::{Backdrop, Drive, Effects, Fx, PRESETS, Rng};
+use effects::{Backdrop, BarTracker, Drive, Effects, Fx, PRESETS, Rng};
 use graphics::Graphics;
 use history::History;
 use kitty::Kitty;
@@ -58,10 +58,8 @@ const LIST_LIMIT: usize = 100;
 const MIX_LIMIT: usize = 25;
 const SEEK_STEP: f64 = 10.0;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
-/// Check for baked-in black bars every this many frames; use a new crop once this many
-/// checks in a row agree (dark scenes and fades shouldn't make it jump).
+/// Check for baked-in black bars every this many frames.
 const CROP_EVERY: u64 = 8;
-const CROP_VOTES: u32 = 3;
 /// Consecutive videos that may fail to play before the queue stops.
 const MAX_FAILS: u32 = 3;
 /// Resolve the next video once the current one has played this long.
@@ -458,10 +456,8 @@ pub struct App {
     backdrop: Backdrop,
     /// Fill space around the video with a blurred, darkened copy of it.
     pub fill: bool,
-    /// Picture area inside black bars baked into the video, once stable.
-    crop: Option<effects::Crop>,
-    /// Latest detected crop and how many detections in a row agreed with it.
-    crop_vote: (effects::Crop, u32),
+    /// Picture area inside black bars baked into the video.
+    bars: BarTracker,
     pub renderer: Renderer,
     /// Present when the terminal can show pixel graphics (kitty protocol or sixel).
     graphics: Option<Graphics>,
@@ -563,8 +559,7 @@ impl App {
             paused_key: None,
             backdrop: Backdrop::default(),
             fill: true,
-            crop: None,
-            crop_vote: ((0, 0, 0, 0), 0),
+            bars: BarTracker::default(),
             renderer: if graphics.is_some() {
                 Renderer::Graphics
             } else {
@@ -843,8 +838,7 @@ impl App {
             Ok(p) => {
                 self.remember_played(&p);
                 self.player = Some(p);
-                self.crop = None;
-                self.crop_vote.1 = 0;
+                self.bars.reset();
                 self.analyzer.reset();
                 self.effects.reset();
             }
@@ -1261,7 +1255,13 @@ impl App {
                     self.bypass,
                 )
                     .hash(&mut h);
-                (self.effects.intensity.to_bits(), self.fill, self.crop, area).hash(&mut h);
+                (
+                    self.effects.intensity.to_bits(),
+                    self.fill,
+                    self.bars.crop(f.w, f.h),
+                    area,
+                )
+                    .hash(&mut h);
                 (self.renderer == Renderer::Graphics, self.open_menu()).hash(&mut h);
                 self.cell_aspect.to_bits().hash(&mut h);
                 // Keep rendering until the last hit has faded out, then hold still.
@@ -1274,22 +1274,9 @@ impl App {
             self.paused_key = key;
             // Look for baked-in black bars on the clean frame (effects add grain to them).
             if self.fill && self.ticks.is_multiple_of(CROP_EVERY) {
-                let found = effects::content_rect(&f.data, f.w, f.h);
-                let close = |a: usize, b: usize| a.abs_diff(b) <= 2;
-                let (prev, n) = self.crop_vote;
-                let same = close(found.0, prev.0)
-                    && close(found.1, prev.1)
-                    && close(found.2, prev.2)
-                    && close(found.3, prev.3);
-                self.crop_vote = (found, if same { n + 1 } else { 1 });
-                if self.crop_vote.1 >= CROP_VOTES {
-                    self.crop = Some(found);
-                }
+                self.bars.observe(&f.data, f.w, f.h);
             }
-            let crop = self
-                .crop
-                .filter(|c| c.2 <= f.w && c.3 <= f.h)
-                .unwrap_or((0, 0, f.w, f.h));
+            let crop = self.bars.crop(f.w, f.h);
             if self.bypass {
                 self.fx_out.clear();
                 self.fx_out
