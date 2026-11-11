@@ -102,6 +102,7 @@ Player:
 | `[` `]` | Effect intensity down / up (0.1 to 2.0) |
 | `,` `.` | Audio delay 10 ms shorter / longer (see "Audio delay") |
 | `e` | Open / close the effects menu (also the `◂ FX n` button in the HUD) |
+| `x` | All effects off / on, keeping the picked ones (also the `FX ON` button in the HUD) |
 | `r` / `R` | Resolution up / down (graphics renderer) |
 | `g` | Switch between pixel graphics and text blocks |
 | `f` | Blurred background around narrow videos on / off |

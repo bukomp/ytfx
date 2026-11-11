@@ -435,6 +435,10 @@ pub struct App {
     /// Set by ui::draw for mouse clicks: the FX button, the menu's inside, and which
     /// effect each menu row shows (screen row, index into `Fx::ALL`).
     pub fx_button: Option<Rect>,
+    /// The HUD button that turns every effect off and on again.
+    pub bypass_button: Option<Rect>,
+    /// All effects off: frames show as they come, the picked effects stay picked.
+    pub bypass: bool,
     pub fx_menu_rect: Option<Rect>,
     pub fx_rows: Vec<(u16, usize)>,
     /// The menu's page tabs and where the frequency panel's parts are.
@@ -545,6 +549,8 @@ impl App {
             freq_scroll: 0,
             freq_anchor: None,
             fx_button: None,
+            bypass_button: None,
+            bypass: false,
             fx_menu_rect: None,
             fx_rows: Vec::new(),
             fx_tabs: Vec::new(),
@@ -1247,7 +1253,14 @@ impl App {
             let key = paused.then(|| {
                 use std::hash::{DefaultHasher, Hash, Hasher};
                 let mut h = DefaultHasher::new();
-                (f.pts.to_bits(), f.w, f.h, self.effects.enabled()).hash(&mut h);
+                (
+                    f.pts.to_bits(),
+                    f.w,
+                    f.h,
+                    self.effects.enabled(),
+                    self.bypass,
+                )
+                    .hash(&mut h);
                 (self.effects.intensity.to_bits(), self.fill, self.crop, area).hash(&mut h);
                 (self.renderer == Renderer::Graphics, self.open_menu()).hash(&mut h);
                 self.cell_aspect.to_bits().hash(&mut h);
@@ -1277,8 +1290,14 @@ impl App {
                 .crop
                 .filter(|c| c.2 <= f.w && c.3 <= f.h)
                 .unwrap_or((0, 0, f.w, f.h));
-            self.effects
-                .render(&f.data, f.w, f.h, self.drive, dt, &mut self.fx_out);
+            if self.bypass {
+                self.fx_out.clear();
+                self.fx_out
+                    .extend_from_slice(&f.data[..(f.w * f.h * 3).min(f.data.len())]);
+            } else {
+                self.effects
+                    .render(&f.data, f.w, f.h, self.drive, dt, &mut self.fx_out);
+            }
             if let Some(why) = self.effects.gpu_failure() {
                 self.status = Some((format!("effects run on the CPU: {why}"), false));
             }
@@ -1729,6 +1748,19 @@ impl App {
         }
     }
 
+    /// Turn every effect off, or back on as they were picked.
+    fn toggle_bypass(&mut self) {
+        self.bypass = !self.bypass;
+        // Trails and held frames from before would jump in when the effects return.
+        self.effects.reset();
+        let msg = if self.bypass {
+            "effects off"
+        } else {
+            "effects on"
+        };
+        self.status = Some((msg.into(), false));
+    }
+
     /// Keys for the open effects menu. Returns false for keys it leaves to the player.
     fn fx_menu_key(&mut self, k: KeyEvent) -> bool {
         match k.code {
@@ -1921,6 +1953,9 @@ impl App {
                 self.fx_menu = !self.fx_menu;
                 return;
             }
+            if self.bypass_button.is_some_and(|r| r.contains(pos)) {
+                return self.toggle_bypass();
+            }
             if let Some(&(_, page)) = self.fx_tabs.iter().find(|t| t.0.contains(pos)) {
                 self.fx_page = page;
                 return;
@@ -2024,6 +2059,7 @@ impl App {
                 self.fx_menu = true;
                 return;
             }
+            KeyCode::Char('x') => return self.toggle_bypass(),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                 return self.stop_playback(None);
             }

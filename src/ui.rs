@@ -111,6 +111,7 @@ pub fn fit(area: Rect, aspect: f64, max_width: u16) -> (usize, usize) {
 pub fn draw(f: &mut Frame, app: &mut App) {
     // Click targets are set again by whatever gets drawn this frame.
     app.fx_button = None;
+    app.bypass_button = None;
     app.fx_menu_rect = None;
     app.fx_rows.clear();
     app.fx_tabs.clear();
@@ -1483,12 +1484,24 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
                 .bold()
         },
     );
+    let bypass = if app.bypass {
+        Span::styled(
+            " FX OFF ",
+            Style::new().fg(Color::Black).bg(Color::Gray).bold(),
+        )
+    } else {
+        Span::styled(" FX ON ", Style::new().fg(ACCENT).bold())
+    };
     let help = Span::styled("? help ", Style::new().fg(DIM));
     let room = (bottom.width as usize).saturating_sub(
-        spans.iter().map(Span::width).sum::<usize>() + button.width() + help.width() + 1,
+        spans.iter().map(Span::width).sum::<usize>()
+            + bypass.width()
+            + button.width()
+            + help.width()
+            + 2,
     );
     let mut names = String::new();
-    for fx in app.effects.enabled() {
+    for fx in app.effects.enabled().into_iter().filter(|_| !app.bypass) {
         let more = if names.is_empty() { 0 } else { 1 };
         if names.len() + more + fx.label().len() + 2 > room {
             names.push_str(" …");
@@ -1502,17 +1515,31 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
     spans.push(Span::styled(names, Style::new().fg(ACCENT)));
     f.render_widget(Paragraph::new(Line::from(spans)), bottom);
 
-    let bw = (button.width() + help.width()) as u16;
+    let (hw, xw, fw) = (help.width(), bypass.width(), button.width());
+    let bw = (hw + xw + 1 + fw) as u16;
     if bottom.width > bw {
         let rect = Rect {
             x: bottom.right() - bw,
             width: bw,
             ..bottom
         };
-        f.render_widget(Paragraph::new(Line::from(vec![help, button.clone()])), rect);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                help,
+                bypass,
+                Span::raw(" "),
+                button.clone(),
+            ])),
+            rect,
+        );
+        app.bypass_button = Some(Rect {
+            x: rect.x + hw as u16,
+            width: xw as u16,
+            ..bottom
+        });
         app.fx_button = Some(Rect {
-            x: bottom.right() - button.width() as u16,
-            width: button.width() as u16,
+            x: bottom.right() - fw as u16,
+            width: fw as u16,
             ..bottom
         });
     }
@@ -1532,6 +1559,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ),
             ("p / P", "next / previous preset"),
             ("e / FX button", "effects menu: pick any of the effects"),
+            ("x / FX ON button", "all effects off / on (keeps the picks)"),
             (
                 "  in the menu",
                 "↑↓ jk move, space/enter toggle, c clear all",
