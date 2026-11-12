@@ -1,5 +1,5 @@
 //! Settings that survive restarts: which effects are on, preset, intensity, sync,
-//! the hit sensitivity per 50 Hz slice, the audio output delay, the background fill and the browser's preview pane. Saved to `settings.json` in the
+//! the hit sensitivity per 50 Hz slice, the audio output delay, the picture brightness, the background fill and the browser's preview pane. Saved to `settings.json` in the
 //! config directory whenever one of them changes.
 
 use std::collections::BTreeMap;
@@ -26,6 +26,8 @@ pub struct Settings {
     pub freq_sensitivity: Option<BTreeMap<u32, f32>>,
     /// How long the audio output takes to be heard, in ms (see `audio::MAX_DELAY_MS`).
     pub audio_delay_ms: Option<u32>,
+    /// Picture brightness in percent (see `effects::BRIGHTNESS_MIN` and `_MAX`).
+    pub brightness: Option<u32>,
 }
 
 /// The saved settings; anything missing or unreadable falls back to the defaults.

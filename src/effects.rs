@@ -1922,6 +1922,25 @@ pub struct Backdrop {
     sums: Vec<u32>,
 }
 
+/// Lowest, highest and step of the picture brightness, in percent.
+pub const BRIGHTNESS_MIN: u32 = 20;
+pub const BRIGHTNESS_MAX: u32 = 200;
+pub const BRIGHTNESS_STEP: u32 = 10;
+
+/// Scale every channel of an RGB buffer by `percent` / 100, clipping at white.
+pub fn brighten(buf: &mut [u8], percent: u32) {
+    if percent == 100 {
+        return;
+    }
+    let mut lut = [0u8; 256];
+    for (v, out) in lut.iter_mut().enumerate() {
+        *out = ((v as u32 * percent + 50) / 100).min(255) as u8;
+    }
+    for b in buf {
+        *b = lut[*b as usize];
+    }
+}
+
 /// Part of a frame as (x0, y0, x1, y1), end exclusive.
 pub type Crop = (usize, usize, usize, usize);
 
@@ -2167,6 +2186,18 @@ impl Backdrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brighten_scales_and_clips() {
+        let mut buf = [0, 100, 200, 255];
+        brighten(&mut buf, 100);
+        assert_eq!(buf, [0, 100, 200, 255]);
+        brighten(&mut buf, 150);
+        assert_eq!(buf, [0, 150, 255, 255]);
+        let mut buf = [0, 100, 200, 255];
+        brighten(&mut buf, 50);
+        assert_eq!(buf, [0, 50, 100, 128]);
+    }
 
     #[test]
     fn all_effects_survive_odd_sizes_and_extreme_drive() {

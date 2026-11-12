@@ -112,6 +112,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Click targets are set again by whatever gets drawn this frame.
     app.fx_button = None;
     app.bypass_button = None;
+    app.dimmer_button = None;
+    app.brighter_button = None;
     app.fx_menu_rect = None;
     app.fx_rows.clear();
     app.fx_tabs.clear();
@@ -1493,8 +1495,25 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(" FX ON ", Style::new().fg(ACCENT).bold())
     };
     let help = Span::styled("? help ", Style::new().fg(DIM));
+    // Brightness: click the minus or plus to step it.
+    let step_style = Style::new()
+        .fg(Color::White)
+        .bg(Color::Rgb(40, 40, 48))
+        .bold();
+    let dimmer = Span::styled(" − ", step_style);
+    let level = Span::styled(
+        format!(" ☀{:>3}% ", app.brightness),
+        if app.brightness == 100 {
+            Style::new().fg(DIM)
+        } else {
+            Style::new().fg(Color::White)
+        },
+    );
+    let brighter = Span::styled(" + ", step_style);
+    let light_w = dimmer.width() + level.width() + brighter.width() + 1;
     let room = (bottom.width as usize).saturating_sub(
         spans.iter().map(Span::width).sum::<usize>()
+            + light_w
             + bypass.width()
             + button.width()
             + help.width()
@@ -1516,7 +1535,8 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), bottom);
 
     let (hw, xw, fw) = (help.width(), bypass.width(), button.width());
-    let bw = (hw + xw + 1 + fw) as u16;
+    let (dw, lw) = (dimmer.width(), level.width());
+    let bw = (hw + light_w + xw + 1 + fw) as u16;
     if bottom.width > bw {
         let rect = Rect {
             x: bottom.right() - bw,
@@ -1526,14 +1546,28 @@ fn draw_hud(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 help,
+                dimmer,
+                level,
+                brighter,
+                Span::raw(" "),
                 bypass,
                 Span::raw(" "),
                 button.clone(),
             ])),
             rect,
         );
-        app.bypass_button = Some(Rect {
+        app.dimmer_button = Some(Rect {
             x: rect.x + hw as u16,
+            width: dw as u16,
+            ..bottom
+        });
+        app.brighter_button = Some(Rect {
+            x: rect.x + (hw + dw + lw) as u16,
+            width: 3,
+            ..bottom
+        });
+        app.bypass_button = Some(Rect {
+            x: rect.x + (hw + light_w) as u16,
             width: xw as u16,
             ..bottom
         });
@@ -1560,6 +1594,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
             ("p / P", "next / previous preset"),
             ("e / FX button", "effects menu: pick any of the effects"),
             ("x / FX ON button", "all effects off / on (keeps the picks)"),
+            ("- / + or − +", "picture darker / brighter, 20% to 200%"),
             (
                 "  in the menu",
                 "↑↓ jk move, space/enter toggle, c clear all",

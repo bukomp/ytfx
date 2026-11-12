@@ -40,7 +40,10 @@ use ratatui::widgets::ListState;
 use account::Account;
 use analysis::{Analyzer, SLICE_HZ, SLICES};
 use audio::AudioOut;
-use effects::{Backdrop, BarTracker, Drive, Effects, Fx, PRESETS, Rng};
+use effects::{
+    BRIGHTNESS_MAX, BRIGHTNESS_MIN, BRIGHTNESS_STEP, Backdrop, BarTracker, Drive, Effects, Fx,
+    PRESETS, Rng,
+};
 use graphics::Graphics;
 use history::History;
 use kitty::Kitty;
@@ -437,6 +440,11 @@ pub struct App {
     pub bypass_button: Option<Rect>,
     /// All effects off: frames show as they come, the picked effects stay picked.
     pub bypass: bool,
+    /// Picture brightness in percent, applied after the effects (also with them off).
+    pub brightness: u32,
+    /// The HUD buttons that make the picture darker and brighter.
+    pub dimmer_button: Option<Rect>,
+    pub brighter_button: Option<Rect>,
     pub fx_menu_rect: Option<Rect>,
     pub fx_rows: Vec<(u16, usize)>,
     /// The menu's page tabs and where the frequency panel's parts are.
@@ -549,6 +557,9 @@ impl App {
             fx_button: None,
             bypass_button: None,
             bypass: false,
+            brightness: 100,
+            dimmer_button: None,
+            brighter_button: None,
             fx_menu_rect: None,
             fx_rows: Vec::new(),
             fx_tabs: Vec::new(),
@@ -1256,6 +1267,7 @@ impl App {
                     f.h,
                     self.effects.enabled(),
                     self.bypass,
+                    self.brightness,
                 )
                     .hash(&mut h);
                 (
@@ -1304,6 +1316,7 @@ impl App {
                 self.effects
                     .render(src, sw, sh, self.drive, dt, &mut self.fx_out);
             }
+            effects::brighten(&mut self.fx_out, self.brightness);
             if let Some(why) = self.effects.gpu_failure() {
                 self.status = Some((format!("effects run on the CPU: {why}"), false));
             }
@@ -1426,6 +1439,10 @@ impl App {
         self.fill = s.fill.unwrap_or(true);
         self.show_preview = s.preview.unwrap_or(true);
         self.set_audio_delay(s.audio_delay_ms.unwrap_or(0));
+        self.brightness = s
+            .brightness
+            .unwrap_or(100)
+            .clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
         for (hz, v) in s.freq_sensitivity.unwrap_or_default() {
             if hz % SLICE_HZ == 0 {
                 self.analyzer
@@ -1449,6 +1466,7 @@ impl App {
             fill: Some(self.fill),
             preview: Some(self.show_preview),
             audio_delay_ms: Some(self.audio_delay_ms),
+            brightness: Some(self.brightness),
             freq_sensitivity: Some(
                 (0..SLICES)
                     .map(|i| (i, self.analyzer.slice_sensitivity(i)))
@@ -1767,6 +1785,18 @@ impl App {
         self.status = Some((msg.into(), false));
     }
 
+    /// Make the picture brighter (`up`) or darker by one step, and save it.
+    fn step_brightness(&mut self, up: bool) {
+        self.brightness = if up {
+            self.brightness + BRIGHTNESS_STEP
+        } else {
+            self.brightness.saturating_sub(BRIGHTNESS_STEP)
+        }
+        .clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+        self.status = Some((format!("brightness {}%", self.brightness), false));
+        self.save_settings();
+    }
+
     /// Keys for the open effects menu. Returns false for keys it leaves to the player.
     fn fx_menu_key(&mut self, k: KeyEvent) -> bool {
         match k.code {
@@ -1962,6 +1992,12 @@ impl App {
             if self.bypass_button.is_some_and(|r| r.contains(pos)) {
                 return self.toggle_bypass();
             }
+            if self.dimmer_button.is_some_and(|r| r.contains(pos)) {
+                return self.step_brightness(false);
+            }
+            if self.brighter_button.is_some_and(|r| r.contains(pos)) {
+                return self.step_brightness(true);
+            }
             if let Some(&(_, page)) = self.fx_tabs.iter().find(|t| t.0.contains(pos)) {
                 self.fx_page = page;
                 return;
@@ -2066,6 +2102,8 @@ impl App {
                 return;
             }
             KeyCode::Char('x') => return self.toggle_bypass(),
+            KeyCode::Char('-') => return self.step_brightness(false),
+            KeyCode::Char('=' | '+') => return self.step_brightness(true),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                 return self.stop_playback(None);
             }
