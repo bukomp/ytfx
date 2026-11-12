@@ -6,9 +6,11 @@ mod gpu;
 mod graphics;
 mod history;
 mod kitty;
+mod media;
 mod player;
 mod preview;
 mod queue;
+mod resume;
 mod settings;
 mod sixel;
 mod textinput;
@@ -47,8 +49,10 @@ use effects::{
 use graphics::Graphics;
 use history::History;
 use kitty::Kitty;
+use media::Media;
 use player::Player;
 use queue::{Queue, RADIO_LOW};
+use resume::Resume;
 use sixel::Sixel;
 use textinput::TextInput;
 use youtube::{Entry, Kind, SearchKind, StreamInfo};
@@ -60,6 +64,11 @@ const SEARCH_COUNT: usize = 25;
 const LIST_LIMIT: usize = 100;
 const MIX_LIMIT: usize = 25;
 const SEEK_STEP: f64 = 10.0;
+/// The media "previous" key restarts the video when it is further in than this (seconds);
+/// otherwise it goes to the video before.
+const RESTART_WITHIN: f64 = 3.0;
+/// How often the playing video's position is saved, in case ytfx doesn't exit cleanly.
+const RESUME_SAVE_EVERY: Duration = Duration::from_secs(15);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Check for baked-in black bars every this many frames.
 const CROP_EVERY: u64 = 8;
@@ -493,6 +502,17 @@ pub struct App {
     resize_at: Option<Instant>,
     rng: Rng,
     free_pulse: f32,
+    /// OS media keys, headphone buttons and the "Now Playing" widget.
+    media: Media,
+    /// Where videos were left off.
+    resume: Resume,
+    /// The next video to start was picked on its own (not from a playlist, feed, queue
+    /// or radio), so it picks up where it was left off.
+    resume_next: bool,
+    /// The video id the player plays, for remembering where it stopped.
+    player_video: Option<String>,
+    /// When the playing video's position was last saved.
+    resume_saved_at: Instant,
     quit: bool,
 }
 
@@ -508,6 +528,7 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map_or(0x2545_f491_4f6c_dd1d, |d| d.as_nanos() as u64);
         let (tx, rx) = mpsc::channel();
+        let (media, media_error) = Media::new();
         let mut app = App {
             sync: cfg.sync,
             tab: Tab::Search,
@@ -595,9 +616,17 @@ impl App {
             resize_at: None,
             rng: Rng::new(seed),
             free_pulse: 0.0,
+            media,
+            resume: Resume::load(),
+            resume_next: false,
+            player_video: None,
+            resume_saved_at: Instant::now(),
             quit: false,
             cfg,
         };
+        if let Some(e) = media_error {
+            app.status = Some((e, true));
+        }
         app.apply_settings(settings::load());
         app.sync_history();
         if let Some(q) = app.cfg.initial.take() {
@@ -760,7 +789,7 @@ impl App {
                     views: None,
                     meta: Default::default(),
                 };
-                self.play_entries(&[entry], 0);
+                self.play_single(entry);
             }
             // Not YouTube: yt-dlp may still know the site. No queue for it.
             None => {
@@ -778,6 +807,35 @@ impl App {
         self.show_video = true;
         self.fails = 0;
         self.awaiting_radio = false;
+        self.resume_next = false;
+    }
+
+    /// Play one video on its own: it picks up where it was left off.
+    fn play_single(&mut self, entry: Entry) {
+        self.queue.set(&[entry], 0);
+        self.begin_playback();
+        self.resume_next = true;
+        self.play_current();
+    }
+
+    /// Stop the player, remembering where its video got to.
+    fn drop_player(&mut self) {
+        self.save_position();
+        self.player = None;
+        self.player_video = None;
+    }
+
+    /// Remember where the playing video is, so playing it on its own again resumes there.
+    fn save_position(&mut self) {
+        self.resume_saved_at = Instant::now();
+        let (Some(p), Some(id)) = (&self.player, &self.player_video) else {
+            return;
+        };
+        if self.resume.note(id, p.position(), p.duration)
+            && let Err(e) = self.resume.save()
+        {
+            self.status = Some((format!("couldn't save the play position: {e:#}"), true));
+        }
     }
 
     fn play_entries(&mut self, entries: &[Entry], start: usize) {
@@ -802,7 +860,7 @@ impl App {
     }
 
     fn start_resolve(&mut self, url: String, title: String, id: Option<String>) {
-        self.player = None;
+        self.drop_player();
         self.frame_dims = (0, 0);
         let short: String = title.chars().take(50).collect();
         self.busy = Some(format!("loading {short}"));
@@ -848,10 +906,25 @@ impl App {
             return;
         }
         let size = self.decode_size(self.area, info.aspect);
-        match Player::new(info, &self.audio, size, self.cfg.fps) {
+        let id = self.queue.current().map(|e| e.target.clone());
+        // Only a video picked on its own resumes; in a list it starts from the top.
+        let start = std::mem::take(&mut self.resume_next)
+            .then(|| id.as_deref().and_then(|id| self.resume.get(id)))
+            .flatten()
+            .filter(|&s| info.duration.is_some_and(|d| s < d));
+        match Player::new(info, &self.audio, size, self.cfg.fps, start.unwrap_or(0.0)) {
             Ok(p) => {
                 self.remember_played(&p);
+                self.show_now_playing(&p);
+                if let Some(s) = start {
+                    self.status = Some((
+                        format!("resumed at {} (0: start over)", ui::fmt_time(s)),
+                        false,
+                    ));
+                }
                 self.player = Some(p);
+                self.player_video = id;
+                self.resume_saved_at = Instant::now();
                 self.bars.reset();
                 self.analyzer.reset();
                 self.effects.reset();
@@ -878,6 +951,75 @@ impl App {
         self.sync_history();
     }
 
+    /// Show the video that just started in the OS "Now Playing" widget.
+    fn show_now_playing(&mut self, p: &Player) {
+        let entry = self.queue.current();
+        let title = match entry {
+            Some(e) if !e.title.starts_with("http") => e.title.clone(),
+            _ if !p.title.is_empty() => p.title.clone(),
+            _ => "ytfx".into(),
+        };
+        self.media.set_track(Some(media::Track {
+            title,
+            artist: entry.map(|e| e.channel.clone()).unwrap_or_default(),
+            cover: entry.and_then(Entry::thumbnail_url),
+            duration: p.duration,
+        }));
+    }
+
+    /// Act on the OS media keys and headphone buttons, and tell the OS what plays.
+    fn handle_media(&mut self) {
+        for cmd in self.media.poll() {
+            self.media_command(cmd);
+        }
+        let state = match &self.player {
+            Some(p) if p.paused() => media::State::Paused(p.position()),
+            Some(p) => media::State::Playing(p.position()),
+            // Between videos of a queue: still "playing" to the OS, so the keys keep
+            // coming here.
+            None if self.active => media::State::Playing(0.0),
+            None => media::State::Stopped,
+        };
+        self.media.set_state(state);
+        if self.player.as_ref().is_some_and(|p| !p.paused())
+            && self.resume_saved_at.elapsed() >= RESUME_SAVE_EVERY
+        {
+            self.save_position();
+        }
+    }
+
+    fn media_command(&mut self, cmd: media::Command) {
+        use media::Command as C;
+        let pos = self.player.as_ref().map(|p| p.position());
+        match cmd {
+            C::Next => return self.skip(true),
+            // Like music players: back to the start first, the video before on a second press.
+            C::Previous if pos.is_none_or(|pos| pos <= RESTART_WITHIN) => {
+                return self.skip(false);
+            }
+            C::Stop => return self.stop_playback(None),
+            _ => {}
+        }
+        let (Some(p), Some(pos)) = (self.player.as_mut(), pos) else {
+            return;
+        };
+        let seek = |p: &mut Player, d: f64| p.seek(d).err().map(|e| (format!("{e:#}"), true));
+        match cmd {
+            C::Play if p.paused() => p.toggle_pause(),
+            C::Pause if !p.paused() => p.toggle_pause(),
+            C::Toggle => p.toggle_pause(),
+            C::OutputChanged if !p.paused() => {
+                p.toggle_pause();
+                self.status = Some(("paused: the audio output changed".into(), false));
+                self.save_position();
+            }
+            C::Previous => self.status = seek(p, -pos),
+            C::SeekBy(d) => self.status = seek(p, d),
+            C::SeekTo(at) => self.status = seek(p, at - pos),
+            _ => {}
+        }
+    }
+
     /// Refresh the history tab's list, keeping the selection on the same video.
     fn sync_history(&mut self) {
         let view = &mut self.tabs[Tab::History as usize][0];
@@ -899,7 +1041,7 @@ impl App {
 
     /// The current video couldn't play: skip it, unless too many failed in a row.
     fn track_failed(&mut self, err: String) {
-        self.player = None;
+        self.drop_player();
         self.fails += 1;
         if self.fails < MAX_FAILS && (self.queue.remaining() > 0 || self.queue.radio) {
             self.status = Some((format!("skipped: {err}"), true));
@@ -911,7 +1053,7 @@ impl App {
 
     /// Move on after the current video, automatically.
     fn next_track(&mut self) {
-        self.player = None;
+        self.drop_player();
         self.frame_dims = (0, 0);
         if self.queue.advance().is_some() {
             self.play_current();
@@ -946,7 +1088,9 @@ impl App {
     }
 
     fn stop_playback(&mut self, status: Option<(String, bool)>) {
-        self.player = None;
+        self.drop_player();
+        self.media.set_track(None);
+        self.media.set_state(media::State::Stopped);
         self.frame_dims = (0, 0);
         self.active = false;
         self.show_video = false;
@@ -1196,6 +1340,7 @@ impl App {
             self.audio.shared.set_test(false);
         }
         self.audio.shared.set_solo(self.solo());
+        self.handle_media();
 
         let Some(p) = self.player.as_mut() else {
             return;
@@ -1711,7 +1856,7 @@ impl App {
         let entry = entry.clone();
         match entry.kind {
             // Feeds and playlists play through.
-            Kind::Video if single => self.play_entries(&[entry], 0),
+            Kind::Video if single => self.play_single(entry),
             Kind::Video => {
                 let entries = self.view().entries.clone();
                 self.play_entries(&entries, i);
@@ -2173,6 +2318,7 @@ impl App {
         let seek = |p: &mut Player, d: f64| p.seek(d).err().map(|e| (format!("{e:#}"), true));
         match k.code {
             KeyCode::Char(' ') => p.toggle_pause(),
+            KeyCode::Char('0') => self.status = seek(p, -p.position()),
             KeyCode::Left => self.status = seek(p, -SEEK_STEP),
             KeyCode::Right => self.status = seek(p, SEEK_STEP),
             _ => {}
@@ -2458,6 +2604,7 @@ fn main() -> Result<()> {
         let _ = g.clear(term.backend_mut());
         let _ = std::io::Write::flush(term.backend_mut());
     }
+    app.drop_player();
     drop(app);
     restore_terminal();
     youtube::remove_cookie_copies(true);

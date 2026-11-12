@@ -77,7 +77,14 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(info: StreamInfo, audio: &AudioOut, size: (usize, usize), fps: u32) -> Result<Self> {
+    /// Start playing `info` at `start` seconds in.
+    pub fn new(
+        info: StreamInfo,
+        audio: &AudioOut,
+        size: (usize, usize),
+        fps: u32,
+        start: f64,
+    ) -> Result<Self> {
         let mut p = Player {
             title: info.title,
             duration: info.duration,
@@ -98,7 +105,7 @@ impl Player {
             retry_at: None,
         };
         p.shared.set_paused(false);
-        p.restart(0.0)?;
+        p.restart(start)?;
         Ok(p)
     }
 

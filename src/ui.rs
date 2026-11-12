@@ -1583,6 +1583,7 @@ fn draw_help(f: &mut Frame, playing: bool) {
     let rows: &[(&str, &str)] = if playing {
         &[
             ("space", "pause / resume"),
+            ("0", "start the video over"),
             ("n / N", "next / previous video in the queue"),
             ("m", "radio: queue videos like this one"),
             ("z", "shuffle the rest of the queue"),

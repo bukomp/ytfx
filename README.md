@@ -91,6 +91,7 @@ Player:
 | Key | Action |
 | --- | --- |
 | `space` | Pause / resume |
+| `0` | Start the video over |
 | `n` / `N` (or `>` / `<`) | Next / previous video in the queue |
 | `m` | Start radio from the playing video |
 | `z` | Shuffle the rest of the queue |
@@ -256,6 +257,23 @@ Radio: `r` in the browser starts radio from the selected video. `R` starts it fr
 
 `b` or `tab` in the player goes to the browser while playback continues. A now-playing line shows at the bottom. In the browser, `v` returns to the video, `space` pauses, and `n` / `N` skip to the next / previous video. In the player, `q`, `esc` or `backspace` stops playback and goes back. The HUD shows the queue position (for example `[3/25]`) and a RADIO badge.
 
+## Media keys and headphones
+
+ytfx reacts to the play/pause, next and previous media keys, to headphone buttons (AirPods taps, wired remotes, Bluetooth headsets) and to the controls in the system's Now Playing widget. The widget shows the title, channel, thumbnail and progress. This works in the player and in the browser.
+
+- Play / pause: pause or resume.
+- Next: the next video in the queue.
+- Previous: back to the start of the video. Press it again within 3 seconds to go to the previous video.
+- Seek bar in the widget: jump to that position.
+
+When the audio output device changes (for example, you unplug headphones), playback pauses.
+
+macOS uses the system media controls (no permission needed). Linux uses MPRIS over D-Bus. For Bluetooth headset buttons on Linux, `mpris-proxy` (part of BlueZ) must run.
+
+## Resume
+
+ytfx remembers where you stopped each video, in `~/.config/ytfx/resume.json` (last 300 videos). When you play that video on its own again (from search results, history or a pasted link), it continues from there. Press `0` to start it over. Videos in a playlist, feed, queue or radio always start from the beginning. A video stopped in the first 10 seconds, or in the last 15 seconds, starts from the beginning next time.
+
 ## Resolution
 
 There are three renderers:
@@ -307,6 +325,8 @@ Video frames are scheduled against the audio clock (samples actually played, min
 - `src/youtube.rs`: `yt-dlp` search and stream URL resolution
 - `src/account.rs`: sign-in (cookie import, saved account)
 - `src/queue.rs`: play queue and radio
+- `src/media.rs`: OS media keys, headphone buttons, Now Playing, output device watch
+- `src/resume.rs`: where each video was left off
 - `src/player.rs`: ffmpeg video and audio decoders, A/V sync, seek, resize
 - `src/audio.rs`: cpal output, volume, and the tap of played samples
 - `src/analysis.rs`: FFT, slice levels, per-slice beat detection
