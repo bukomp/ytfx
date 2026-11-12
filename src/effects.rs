@@ -306,7 +306,7 @@ impl Rng {
     }
 }
 
-/// Length of the VHS grain table (more than one 1080p row, so rows don't repeat visibly).
+/// Length of the VHS grain table (more than one 2160p row, so rows don't repeat visibly).
 const NOISE_LEN: usize = 8192;
 
 pub struct Effects {

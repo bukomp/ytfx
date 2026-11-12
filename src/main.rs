@@ -82,7 +82,7 @@ const RADIO_RETRY: Duration = Duration::from_secs(3);
 /// Fetches in a row that found nothing new before radio gives up waiting.
 const RADIO_MAX_MISSES: u32 = 5;
 /// Video heights in pixels for the graphics renderer (r / R cycle through them).
-pub const RES_STEPS: [usize; 6] = [144, 240, 360, 480, 720, 1080];
+pub const RES_STEPS: [usize; 8] = [144, 240, 360, 480, 720, 1080, 1440, 2160];
 const DEFAULT_RES: usize = 3;
 
 const USAGE: &str = "\
@@ -93,7 +93,7 @@ usage: ytfx [options] [search terms | youtube url]
 options:
   --fps <n>          video/render frame rate (default 30)
   --res <height>     video resolution for the graphics renderer:
-                     144, 240, 360, 480 (default), 720 or 1080
+                     144, 240, 360, 480 (default), 720, 1080, 1440 or 2160
   --renderer <name>  auto (default), kitty or sixel (pixel graphics), blocks (text cells)
   --max-width <n>    max video width in columns for the blocks renderer (default 200)
   --no-sync          start with sync off

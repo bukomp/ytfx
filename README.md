@@ -22,7 +22,7 @@ Options (`ytfx [options] [search terms | youtube url]`):
 ```
 --fps <n>          video/render frame rate (default 30, clamped to 5-60)
 --res <height>     video resolution for the graphics renderer:
-                   144, 240, 360, 480 (default), 720 or 1080
+                   144, 240, 360, 480 (default), 720, 1080, 1440 or 2160
 --renderer <name>  auto (default), kitty or sixel (pixel graphics), blocks (text cells)
 --max-width <n>    max video width in columns for the blocks renderer (default 200)
 --no-sync          start with sync off
