@@ -17,9 +17,15 @@ serde_json = "1.0.154"
 unicode-width = "0.2"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal"] }
 
-# OS media keys and "Now Playing": MPRemoteCommandCenter on macOS, MPRIS (pure-Rust zbus) on Linux.
+# OS media keys and "Now Playing": MPRemoteCommandCenter on macOS (straight through objc2,
+# which wgpu already uses), MPRIS (pure-Rust zbus) on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
-souvlaki = "0.9.3"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSObject", "NSString", "NSURL", "NSValue"] }
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
